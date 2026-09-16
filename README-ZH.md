@@ -122,9 +122,11 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud 配置
-# 每月免费额度即可支撑简单使用：https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# Graphiti 图谱记忆配置（自托管，基于本地 Neo4j）
+# 下面的默认值已经和 docker-compose.neo4j.yml 中的 Neo4j 服务匹配
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=mirofish-local-dev
 ```
 
 #### 2. 安装依赖
@@ -144,7 +146,17 @@ npm run setup
 npm run setup:backend
 ```
 
-#### 3. 启动服务
+#### 3. 启动 Neo4j（图谱记忆后端）
+
+MiroFish 使用 [Graphiti](https://github.com/getzep/graphiti)（Zep Cloud 底层所基于的开源时序知识图谱引擎）自托管在本地 Neo4j 上，替代按量计费的 Zep Cloud API。启动后端前先启动它：
+
+```bash
+docker compose -f docker-compose.neo4j.yml up -d
+```
+
+Neo4j Browser 地址为 http://localhost:7474（Bolt 端口 7687）。
+
+#### 4. 启动服务
 
 ```bash
 # 同时启动前后端（在项目根目录执行）
@@ -168,11 +180,17 @@ npm run frontend  # 仅启动前端
 # 1. 配置环境变量（同源码部署）
 cp .env.example .env
 
-# 2. 拉取镜像并启动
+# 2. 启动 Neo4j（应用容器通过 Docker 网络连接它）
+docker compose -f docker-compose.neo4j.yml up -d
+
+# 3. 拉取镜像并启动
 docker compose up -d
 ```
 
-默认会读取根目录下的 `.env`，并映射端口 `3000（前端）/5001（后端）`
+默认会读取根目录下的 `.env`，并映射端口 `3000（前端）/5001（后端）`。
+如果应用容器无法通过 `localhost:7687` 访问 Neo4j，请将 `.env` 中的 `NEO4J_URI`
+改为 `bolt://mirofish-neo4j:7687`（Neo4j 容器名），并让两个 compose 文件的服务
+处于同一 Docker 网络下，或直接把 `neo4j` 服务合并进 `docker-compose.yml`。
 
 > 在 `docker-compose.yml` 中已通过注释提供加速镜像地址，可按需替换
 

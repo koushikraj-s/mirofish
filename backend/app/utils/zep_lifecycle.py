@@ -1,9 +1,13 @@
-"""Process-local lifecycle coordination for Zep Cloud graphs.
+"""Process-local lifecycle coordination for Graphiti-backed graphs.
 
-The lock is intentionally keyed by graph ID so graph deletion/reset and a new
-simulation updater claim cannot pass each other between validation and their
-Cloud mutation.  It complements (but does not replace) a distributed lock in
-multi-worker deployments.
+The lock is intentionally keyed by graph ID (Graphiti's `group_id`) so graph
+deletion/reset and a new simulation updater claim cannot pass each other
+between validation and their Neo4j mutation. It complements (but does not
+replace) a distributed lock in multi-worker deployments.
+
+This module has no direct dependency on Graphiti or Neo4j -- it only
+coordinates threads within this process -- so it was unaffected by the
+Zep Cloud -> Graphiti migration beyond this docstring.
 """
 
 import threading

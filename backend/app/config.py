@@ -28,9 +28,14 @@ class Config:
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
-    
-    # Zep配置
-    ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+    LLM_REASONING_EFFORT = os.environ.get('LLM_REASONING_EFFORT')
+
+    # Graphiti / Neo4j 图谱记忆配置（自托管，取代 Zep Cloud）
+    # 本地开发默认值对应 docker-compose.neo4j.yml 中的服务；生产部署应通过
+    # 环境变量覆盖，尤其是 NEO4J_PASSWORD。
+    NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+    NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')
+    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD', 'mirofish-local-dev')
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB

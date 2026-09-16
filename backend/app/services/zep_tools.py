@@ -1,5 +1,5 @@
 """
-Zep检索工具服务
+图谱检索工具服务
 封装图谱搜索、节点读取、边查询等工具，供Report Agent使用
 
 核心检索工具（优化后）：
@@ -12,9 +12,14 @@ import time
 import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
-from zep_cloud import NotFoundError
 
-from ..config import Config
+from graphiti_core.errors import NodeNotFoundError
+from graphiti_core.search.search_config_recipes import (
+    EDGE_HYBRID_SEARCH_RRF,
+    NODE_HYBRID_SEARCH_RRF,
+)
+from graphiti_core.nodes import EntityNode as GraphitiEntityNode
+
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 from ..utils.locale import get_locale, t
@@ -24,6 +29,7 @@ from ..utils.zep import (
     get_zep_client,
     normalize_zep_search_limit,
     normalize_zep_search_query,
+    run_async,
 )
 
 logger = get_logger('mirofish.zep_tools')
@@ -405,7 +411,7 @@ class InterviewResult:
 
 class ZepToolsService:
     """
-    Zep检索工具服务
+    图谱检索工具服务
     
     【核心检索工具 - 优化后】
     1. insight_forge - 深度洞察检索（最强大，自动生成子问题，多维度检索）
@@ -427,15 +433,11 @@ class ZepToolsService:
     MAX_RETRIES = 3
     RETRY_DELAY = 2.0
     
-    def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = get_zep_client(self.api_key)
+    def __init__(self, llm_client: Optional[LLMClient] = None):
+        self.client = get_zep_client()
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
-        logger.info(t("console.zepToolsInitialized"))
+        logger.info(t("console.graphToolsInitialized"))
     
     @property
     def llm(self) -> LLMClient:
@@ -445,7 +447,7 @@ class ZepToolsService:
         return self._llm_client
     
     def _call_with_retry(self, func, operation_name: str, max_retries: int = None):
-        """Retry one safe read using typed Zep/HTTPX error classification."""
+        """Retry one safe read using typed Neo4j transient-error classification."""
 
         return call_zep_read_with_retry(
             func,
@@ -464,8 +466,7 @@ class ZepToolsService:
         """
         图谱语义搜索
         
-        使用混合搜索（语义+BM25）在图谱中搜索相关信息。
-        如果Zep Cloud的search API不可用，则降级为本地关键词匹配。
+        使用 Graphiti 的混合搜索（语义+BM25+图距离重排）在本地 Neo4j 图谱中搜索相关信息。
         
         Args:
             graph_id: 图谱ID (Standalone Graph)
@@ -477,18 +478,21 @@ class ZepToolsService:
             SearchResult: 搜索结果
         """
         logger.info(t("console.graphSearch", graphId=graph_id, query=query[:50]))
-        
+
         zep_query = normalize_zep_search_query(query)
         zep_limit = normalize_zep_search_limit(limit)
+        search_config = NODE_HYBRID_SEARCH_RRF if scope == "nodes" else EDGE_HYBRID_SEARCH_RRF
+        search_config = search_config.model_copy(deep=True)
+        search_config.limit = zep_limit
 
         try:
             search_results = self._call_with_retry(
-                func=lambda: self.client.graph.search(
-                    graph_id=graph_id,
-                    query=zep_query,
-                    limit=zep_limit,
-                    scope=scope,
-                    reranker="cross_encoder"
+                func=lambda: run_async(
+                    self.client.search_(
+                        query=zep_query,
+                        config=search_config,
+                        group_ids=[graph_id],
+                    )
                 ),
                 operation_name=t("console.graphSearchOp", graphId=graph_id)
             )
@@ -536,7 +540,7 @@ class ZepToolsService:
         except Exception as e:
             # Authentication, invalid input, missing graphs, and exhausted
             # transient failures must remain visible to the report workflow.
-            logger.error(t("console.zepSearchApiFallback", error=str(e)))
+            logger.error(t("console.graphSearchApiFallback", error=str(e)))
             raise
     
     def _local_search(
@@ -547,7 +551,7 @@ class ZepToolsService:
         scope: str = "edges"
     ) -> SearchResult:
         """
-        本地关键词匹配搜索（作为Zep Search API的降级方案）
+        本地关键词匹配搜索（作为图谱搜索API的降级方案）
         
         获取所有边/节点，然后在本地进行关键词匹配
         
@@ -723,13 +727,15 @@ class ZepToolsService:
         
         try:
             node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=node_uuid),
+                func=lambda: run_async(
+                    GraphitiEntityNode.get_by_uuid(self.client.driver, node_uuid)
+                ),
                 operation_name=t("console.fetchNodeDetailOp", uuid=node_uuid[:8])
             )
-            
+
             if not node:
                 return None
-            
+
             return NodeInfo(
                 uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
                 name=node.name or "",
@@ -737,7 +743,7 @@ class ZepToolsService:
                 summary=node.summary or "",
                 attributes=node.attributes or {}
             )
-        except NotFoundError:
+        except NodeNotFoundError:
             return None
         except Exception as e:
             logger.error(t("console.fetchNodeDetailFailed", error=str(e)))
@@ -1242,7 +1248,7 @@ class ZepToolsService:
         【QuickSearch - 简单搜索】
         
         快速、轻量级的检索工具：
-        1. 直接调用Zep语义搜索
+        1. 直接调用图谱语义搜索
         2. 返回最相关的结果
         3. 适用于简单、直接的检索需求
         

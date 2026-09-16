@@ -43,8 +43,6 @@ class Project:
     # 图谱信息（接口2完成后填充）
     graph_id: Optional[str] = None
     graph_build_task_id: Optional[str] = None
-    zep_batch_id: Optional[str] = None
-    zep_batch_operation_id: Optional[str] = None
     
     # 配置
     simulation_requirement: Optional[str] = None
@@ -68,8 +66,6 @@ class Project:
             "analysis_summary": self.analysis_summary,
             "graph_id": self.graph_id,
             "graph_build_task_id": self.graph_build_task_id,
-            "zep_batch_id": self.zep_batch_id,
-            "zep_batch_operation_id": self.zep_batch_operation_id,
             "simulation_requirement": self.simulation_requirement,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
@@ -95,8 +91,6 @@ class Project:
             analysis_summary=data.get('analysis_summary'),
             graph_id=data.get('graph_id'),
             graph_build_task_id=data.get('graph_build_task_id'),
-            zep_batch_id=data.get('zep_batch_id'),
-            zep_batch_operation_id=data.get('zep_batch_operation_id'),
             simulation_requirement=data.get('simulation_requirement'),
             chunk_size=data.get('chunk_size', 500),
             chunk_overlap=data.get('chunk_overlap', 50),
@@ -226,7 +220,7 @@ class ProjectManager:
 
     @classmethod
     def find_projects_by_graph_id(cls, graph_id: str) -> List[Project]:
-        """Return every persisted project that references a Cloud graph."""
+        """Return every persisted project that references this graph_id."""
 
         return [
             project

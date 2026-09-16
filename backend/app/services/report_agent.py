@@ -1,9 +1,9 @@
 """
 Report Agent服务
-使用LangChain + Zep实现ReACT模式的模拟报告生成
+使用LangChain + Graphiti实现ReACT模式的模拟报告生成
 
 功能：
-1. 根据模拟需求和Zep图谱信息生成报告
+1. 根据模拟需求和图谱信息生成报告
 2. 先规划目录结构，然后分段生成
 3. 每段采用ReACT多轮思考与反思模式
 4. 支持与用户对话，在对话中自主调用检索工具
@@ -903,7 +903,7 @@ class ReportAgent:
             simulation_id: 模拟ID
             simulation_requirement: 模拟需求描述
             llm_client: LLM客户端（可选）
-            zep_tools: Zep工具服务（可选）
+            zep_tools: 图谱工具服务（可选）
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id

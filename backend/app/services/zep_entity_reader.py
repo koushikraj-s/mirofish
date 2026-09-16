@@ -1,16 +1,18 @@
 """
-Zep实体读取与过滤服务
-从Zep图谱中读取节点，筛选出符合预定义实体类型的节点
+图谱实体读取与过滤服务
+从图谱中读取节点，筛选出符合预定义实体类型的节点
 """
 
 from typing import Dict, Any, List, Optional, Set, Callable, TypeVar
 from dataclasses import dataclass, field
-from zep_cloud import NotFoundError
 
-from ..config import Config
+from graphiti_core.edges import EntityEdge as GraphitiEntityEdge
+from graphiti_core.errors import NodeNotFoundError
+from graphiti_core.nodes import EntityNode as GraphitiEntityNode
+
 from ..utils.logger import get_logger
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
-from ..utils.zep import call_zep_read_with_retry, get_zep_client
+from ..utils.zep import call_zep_read_with_retry, get_zep_client, run_async
 
 logger = get_logger('mirofish.zep_entity_reader')
 
@@ -69,20 +71,16 @@ class FilteredEntities:
 
 class ZepEntityReader:
     """
-    Zep实体读取与过滤服务
+    图谱实体读取与过滤服务
     
     主要功能：
-    1. 从Zep图谱读取所有节点
+    1. 从图谱读取所有节点
     2. 筛选出符合预定义实体类型的节点（Labels不只是Entity的节点）
     3. 获取每个实体的相关边和关联节点信息
     """
     
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = get_zep_client(self.api_key)
+    def __init__(self):
+        self.client = get_zep_client()
     
     def _call_with_retry(
         self, 
@@ -92,7 +90,7 @@ class ZepEntityReader:
         initial_delay: float = 2.0
     ) -> T:
         """
-        带重试机制的Zep API调用
+        带重试机制的图谱查询调用
         
         Args:
             func: 要执行的函数（无参数的lambda或callable）
@@ -174,7 +172,7 @@ class ZepEntityReader:
         """
         获取指定节点的相关边。
 
-        Zep Cloud 3.25 的 ``graph.node.get_edges`` 实测只返回节点作为
+        此前 Zep Cloud 集成中 ``graph.node.get_edges`` 只返回节点作为
         source 的边，尽管文档将其描述为“all edges”。需要完整上下文时必须
         提供 graph_id，以全图分页后同时筛选 incoming 和 outgoing 边。
         
@@ -194,9 +192,10 @@ class ZepEntityReader:
                     or edge["target_node_uuid"] == node_uuid
                 ]
 
-            # 使用重试机制调用Zep API
             edges = self._call_with_retry(
-                func=lambda: self.client.graph.node.get_edges(node_uuid=node_uuid),
+                func=lambda: run_async(
+                    GraphitiEntityEdge.get_by_node_uuid(self.client.driver, node_uuid)
+                ),
                 operation_name=f"获取节点边(node={node_uuid[:8]}...)"
             )
             
@@ -354,7 +353,9 @@ class ZepEntityReader:
         try:
             # 使用重试机制获取节点
             node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=entity_uuid),
+                func=lambda: run_async(
+                    GraphitiEntityNode.get_by_uuid(self.client.driver, entity_uuid)
+                ),
                 operation_name=f"获取节点详情(uuid={entity_uuid[:8]}...)"
             )
             
@@ -412,7 +413,7 @@ class ZepEntityReader:
                 related_nodes=related_nodes,
             )
             
-        except NotFoundError:
+        except NodeNotFoundError:
             return None
         except Exception as e:
             # Only an actual Zep 404 means "entity not found". Propagate 401,

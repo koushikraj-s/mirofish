@@ -50,7 +50,7 @@ def normalize_ontology_attribute(attribute: Any) -> Optional[Dict[str, Any]]:
 
 
 def normalize_ontology_attributes(attributes: Any) -> List[Dict[str, Any]]:
-    """Return a non-empty Zep-compatible attribute list within service limits."""
+    """Return a non-empty, Graphiti-safe attribute list within service limits."""
 
     if not isinstance(attributes, list):
         attributes = []
@@ -75,7 +75,7 @@ def normalize_ontology_source_targets(
     *,
     limit: int | None = MAX_ONTOLOGY_SOURCE_TARGETS,
 ) -> List[Dict[str, str]]:
-    """Return unique, structurally valid source-target pairs within Zep limits."""
+    """Return unique, structurally valid source-target pairs within service limits."""
 
     if not isinstance(source_targets, list):
         return []

@@ -9,12 +9,11 @@ import traceback
 import threading
 from contextlib import ExitStack, nullcontext
 from flask import request, jsonify
-from zep_cloud import NotFoundError
 
 from . import graph_bp
 from ..config import Config
 from ..services.ontology_generator import OntologyGenerator
-from ..services.graph_builder import BatchSubmission, GraphBuilderService
+from ..services.graph_builder import GraphBuilderService
 from ..services.text_processor import TextProcessor
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
@@ -74,11 +73,18 @@ def _active_graph_consumers(graph_id: str) -> list[str]:
 
 
 def _delete_cloud_graph_if_present(graph_id: str | None) -> None:
-    """Delete a referenced Cloud graph without retrying the mutation."""
+    """Delete a referenced graph's nodes/edges from Neo4j.
+
+    Graphiti's group-scoped delete is a Cypher `DETACH DELETE` (see
+    `graph_builder.GraphBuilderService.delete_graph`); it matches on
+    `group_id` and is a no-op (deletes zero rows) if the group doesn't
+    exist, so there is no "already absent" error case to special-case here
+    the way Zep Cloud's `NotFoundError` required.
+    """
 
     if not graph_id:
         return
-    # Keep the consumer check and Cloud mutation in one critical section. The
+    # Keep the consumer check and Neo4j mutation in one critical section. The
     # callers that also clear local references hold this re-entrant lock around
     # both operations.
     with graph_lifecycle_lock(graph_id):
@@ -88,17 +94,12 @@ def _delete_cloud_graph_if_present(graph_id: str | None) -> None:
                 f"Graph {graph_id} is in use by active consumer(s): "
                 f"{', '.join(active_simulations)}"
             )
-        try:
-            GraphBuilderService(api_key=Config.ZEP_API_KEY).delete_graph(graph_id)
-        except NotFoundError:
-            logger.info("Zep Cloud graph already absent: %s", graph_id)
+        GraphBuilderService().delete_graph(graph_id)
 
 
 def _clear_project_graph_reference(project) -> None:
     project.graph_id = None
     project.graph_build_task_id = None
-    project.zep_batch_id = None
-    project.zep_batch_operation_id = None
     project.error = None
 
 
@@ -481,18 +482,7 @@ def _build_graph_impl():
     """
     try:
         logger.info("=== 开始构建图谱 ===")
-        
-        # 检查配置
-        errors = []
-        if not Config.ZEP_API_KEY:
-            errors.append(t('api.zepApiKeyMissing'))
-        if errors:
-            logger.error(f"配置错误: {errors}")
-            return jsonify({
-                "success": False,
-                "error": t('api.configError', details="; ".join(errors))
-            }), 500
-        
+
         # 解析请求
         data = request.get_json() or {}
         project_id = data.get('project_id')
@@ -526,7 +516,13 @@ def _build_graph_impl():
                 "error": t('api.ontologyNotGenerated')
             }), 400
         
-        resume_existing_batch = False
+        # Graphiti's add_episode blocks until each episode is fully written to
+        # Neo4j, so unlike the old Zep Cloud Batch API there is no
+        # in-progress server-side job to resume after a lost background
+        # thread (a process restart, say) -- the graph is simply left
+        # partially built. The only recovery path is a fresh rebuild: mark
+        # the stale build failed and require `force` to delete the partial
+        # graph and start over.
         if project.status == ProjectStatus.GRAPH_BUILDING:
             if _project_has_active_build(project):
                 return jsonify({
@@ -540,35 +536,19 @@ def _build_graph_impl():
                     }
                 })
 
-            if (
-                not force
-                and project.graph_id
-                and project.zep_batch_id
-                and project.zep_batch_operation_id
-            ):
-                builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
-                batch_summary = builder.get_batch_summary(project.zep_batch_id)
-                if getattr(batch_summary, "status", None) in {
-                    "queued",
-                    "processing",
-                    "succeeded",
-                }:
-                    resume_existing_batch = True
-
-            if not resume_existing_batch:
-                project.status = ProjectStatus.FAILED
-                project.error = (
-                    "Graph build task is no longer present; the persisted Zep "
-                    "batch cannot be resumed automatically"
-                )
-                ProjectManager.save_project(project)
-                if not force:
-                    return jsonify({
-                        "success": False,
-                        "error": project.error,
-                        "task_id": project.graph_build_task_id,
-                        "recoverable": True,
-                    }), 409
+            project.status = ProjectStatus.FAILED
+            project.error = (
+                "Graph build task is no longer present; the previous build "
+                "cannot be resumed and must be retried with force=true"
+            )
+            ProjectManager.save_project(project)
+            if not force:
+                return jsonify({
+                    "success": False,
+                    "error": project.error,
+                    "task_id": project.graph_build_task_id,
+                    "recoverable": True,
+                }), 409
 
         if project.status == ProjectStatus.GRAPH_COMPLETED and not force:
             return jsonify({
@@ -660,8 +640,8 @@ def _build_graph_impl():
                 )
                 
                 # 创建图谱构建服务
-                builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
-                
+                builder = GraphBuilderService()
+
                 # 分块
                 task_manager.update_task(
                     task_id,
@@ -669,101 +649,57 @@ def _build_graph_impl():
                     progress=5
                 )
                 chunks = TextProcessor.split_text(
-                    text, 
-                    chunk_size=chunk_size, 
+                    text,
+                    chunk_size=chunk_size,
                     overlap=chunk_overlap
                 )
-                builder.validate_batch_chunks(chunks, batch_size=350)
                 total_chunks = len(chunks)
-                
-                if resume_existing_batch:
-                    graph_id = project.graph_id
-                    operation_id = builder.build_operation_id(graph_id, chunks)
-                    if operation_id != project.zep_batch_operation_id:
-                        raise RuntimeError(
-                            "Persisted Zep batch does not match the current graph input"
-                        )
-                    submission = BatchSubmission(
-                        batch_id=project.zep_batch_id,
-                        operation_id=operation_id,
-                        episode_uuids=[],
-                        item_count=total_chunks,
-                    )
-                    task_manager.update_task(
-                        task_id,
-                        message=t('progress.waitingZepProcess'),
-                        progress=55,
-                    )
-                else:
-                    # 创建图谱
-                    task_manager.update_task(
-                        task_id,
-                        message=t('progress.creatingZepGraph'),
-                        progress=10
-                    )
 
-                    def remember_graph(graph_id):
-                        project.graph_id = graph_id
-                        ProjectManager.save_project(project)
-
-                    graph_id = builder.create_graph(
-                        name=graph_name,
-                        graph_id_callback=remember_graph,
-                    )
-
-                    # 设置本体
-                    task_manager.update_task(
-                        task_id,
-                        message=t('progress.settingOntology'),
-                        progress=15
-                    )
-                    builder.set_ontology(graph_id, ontology)
-
-                    # 添加文本（progress_callback 签名是 (msg, progress_ratio)）
-                    def add_progress_callback(msg, progress_ratio):
-                        progress = 15 + int(progress_ratio * 40)  # 15% - 55%
-                        task_manager.update_task(
-                            task_id,
-                            message=msg,
-                            progress=progress
-                        )
-
-                    task_manager.update_task(
-                        task_id,
-                        message=t('progress.addingChunks', count=total_chunks),
-                        progress=15
-                    )
-
-                    def remember_batch(batch_id, operation_id):
-                        project.zep_batch_id = batch_id
-                        project.zep_batch_operation_id = operation_id
-                        ProjectManager.save_project(project)
-
-                    submission = builder.add_text_batches(
-                        graph_id,
-                        chunks,
-                        batch_size=350,
-                        progress_callback=add_progress_callback,
-                        batch_created_callback=remember_batch,
-                    )
-                
-                # 等待Zep处理完成（查询每个episode的processed状态）
+                # 创建图谱（本地生成 graph_id）
                 task_manager.update_task(
                     task_id,
-                    message=t('progress.waitingZepProcess'),
-                    progress=55
+                    message=t('progress.creatingGraph'),
+                    progress=10
                 )
-                
-                def wait_progress_callback(msg, progress_ratio):
-                    progress = 55 + int(progress_ratio * 35)  # 55% - 90%
+
+                def remember_graph(graph_id):
+                    project.graph_id = graph_id
+                    ProjectManager.save_project(project)
+
+                graph_id = builder.create_graph(
+                    name=graph_name,
+                    graph_id_callback=remember_graph,
+                )
+
+                # 设置本体（构建运行时 Pydantic 类型）
+                task_manager.update_task(
+                    task_id,
+                    message=t('progress.settingOntology'),
+                    progress=15
+                )
+                builder.set_ontology(graph_id, ontology)
+
+                # 逐块写入 Graphiti（progress_callback 签名是 (msg, progress_ratio)）
+                def add_progress_callback(msg, progress_ratio):
+                    progress = 15 + int(progress_ratio * 80)  # 15% - 95%
                     task_manager.update_task(
                         task_id,
                         message=msg,
                         progress=progress
                     )
-                
-                builder._wait_for_batch(submission, wait_progress_callback)
-                
+
+                task_manager.update_task(
+                    task_id,
+                    message=t('progress.addingChunks', count=total_chunks),
+                    progress=15
+                )
+
+                builder.add_text_batches(
+                    graph_id,
+                    chunks,
+                    progress_callback=add_progress_callback,
+                )
+
                 # 获取图谱数据
                 task_manager.update_task(
                     task_id,
@@ -794,7 +730,6 @@ def _build_graph_impl():
                             "node_count": node_count,
                             "edge_count": edge_count,
                             "chunk_count": total_chunks,
-                            "zep_batch_id": submission.batch_id,
                         }
                     )
                 
@@ -824,7 +759,6 @@ def _build_graph_impl():
             "data": {
                 "project_id": project_id,
                 "task_id": task_id,
-                "resumed": resume_existing_batch,
                 "message": t('api.graphBuildStarted', taskId=task_id)
             }
         })
@@ -882,13 +816,7 @@ def get_graph_data(graph_id: str):
     获取图谱数据（节点和边）
     """
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
-        builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+        builder = GraphBuilderService()
         graph_data = builder.get_graph_data(graph_id)
         
         return jsonify({
@@ -907,15 +835,9 @@ def get_graph_data(graph_id: str):
 @graph_bp.route('/delete/<graph_id>', methods=['DELETE'])
 def delete_graph(graph_id: str):
     """
-    删除Zep图谱
+    删除图谱
     """
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
         projects = ProjectManager.find_projects_by_graph_id(graph_id)
         if not projects:
             return jsonify({

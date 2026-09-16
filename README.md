@@ -122,9 +122,11 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud Configuration
-# Free monthly quota is sufficient for simple usage: https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# Graphiti graph memory configuration (self-hosted, backed by local Neo4j)
+# Defaults below already match docker-compose.neo4j.yml's Neo4j service.
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=mirofish-local-dev
 ```
 
 #### 2. Install Dependencies
@@ -144,7 +146,20 @@ npm run setup
 npm run setup:backend
 ```
 
-#### 3. Start Services
+#### 3. Start Neo4j (Graph Memory Backend)
+
+MiroFish uses [Graphiti](https://github.com/getzep/graphiti) (the open-source
+temporal knowledge graph engine Zep Cloud is built on) self-hosted against a
+local Neo4j instance instead of the metered Zep Cloud API. Start it once
+before running the backend:
+
+```bash
+docker compose -f docker-compose.neo4j.yml up -d
+```
+
+Neo4j Browser is then available at http://localhost:7474 (bolt on 7687).
+
+#### 4. Start Services
 
 ```bash
 # Start both frontend and backend (run from project root)
@@ -168,11 +183,18 @@ npm run frontend  # Start frontend only
 # 1. Configure environment variables (same as source deployment)
 cp .env.example .env
 
-# 2. Pull image and start
+# 2. Start Neo4j (the app container connects to it over the Docker network)
+docker compose -f docker-compose.neo4j.yml up -d
+
+# 3. Pull image and start
 docker compose up -d
 ```
 
-Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 (backend)`
+Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 (backend)`.
+If the app container can't reach `localhost:7687` for Neo4j, set `NEO4J_URI` in
+`.env` to `bolt://mirofish-neo4j:7687` (the Neo4j container's name) and put both
+compose files on the same Docker network, or merge the `neo4j` service into
+`docker-compose.yml` directly.
 
 > Mirror address for faster pulling is provided as comments in `docker-compose.yml`, replace if needed.
 
