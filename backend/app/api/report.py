@@ -6,6 +6,7 @@ Report API路由
 import os
 import traceback
 import threading
+from typing import Any, Dict
 from flask import request, jsonify, send_file
 
 from . import report_bp
@@ -25,6 +26,57 @@ from ..utils.zep_lifecycle import (
 )
 
 logger = get_logger('mirofish.api.report')
+
+
+def _build_report_coverage(simulation_id: str) -> Dict[str, Any]:
+    """
+    计算报告的覆盖度caveat：当报告来自一个未能"干净"完成的运行时
+    （运行本身FAILED，或图谱记忆写入没有被确认完整完成），附带说明这一点
+    的元数据，而不是把报告原样呈现得像什么都没缺一样。
+
+    这是尽力而为的估算：真正逐条核对episode是否已写入图谱不在这里的能力
+    范围内（更新器排空后就从ZepGraphMemoryManager里移除了，统计信息不会
+    持久化），因此这里给出的是run_state.json中留存的轮次/动作计数等
+    代理指标，而不是精确的图谱端计数。
+
+    Returns:
+        {"graph_possibly_incomplete": bool, "coverage": {...} | None}
+    """
+    run_state = SimulationRunner.get_run_state(simulation_id)
+    if run_state is None:
+        # 没有运行状态可参考时，不能断言报告是完整的。
+        return {"graph_possibly_incomplete": True, "coverage": None}
+
+    # Defensive getattr throughout: callers (including tests) may hand back
+    # a minimal stand-in for run_state that only sets runner_status, and a
+    # real SimulationRunState loaded from an older run_state.json predates
+    # some of these fields too. Coverage metadata is inherently best-effort,
+    # so a missing field degrades to an honest default rather than a 500.
+    runner_status = getattr(run_state, "runner_status", None)
+    graph_memory_enabled = getattr(run_state, "graph_memory_enabled", False)
+    graph_ingestion_complete = getattr(run_state, "graph_ingestion_complete", True)
+    failed = runner_status == RunnerStatus.FAILED
+    possibly_incomplete = bool(
+        failed or (graph_memory_enabled and not graph_ingestion_complete)
+    )
+
+    coverage = {
+        "runner_status": runner_status.value if runner_status else None,
+        "rounds_completed": getattr(run_state, "current_round", None),
+        "total_rounds": getattr(run_state, "total_rounds", None),
+        "twitter_rounds_completed": getattr(run_state, "twitter_current_round", None),
+        "reddit_rounds_completed": getattr(run_state, "reddit_current_round", None),
+        "twitter_actions_count": getattr(run_state, "twitter_actions_count", None),
+        "reddit_actions_count": getattr(run_state, "reddit_actions_count", None),
+        "graph_memory_enabled": graph_memory_enabled,
+        "graph_ingestion_complete": graph_ingestion_complete,
+        "run_error": getattr(run_state, "error", None),
+    }
+
+    return {
+        "graph_possibly_incomplete": possibly_incomplete,
+        "coverage": coverage,
+    }
 
 
 # ============== 报告生成接口 ==============
@@ -95,23 +147,30 @@ def generate_report():
             return jsonify({
                 "success": False,
                 "error": (
-                    "Simulation or Zep graph ingestion is still active; "
+                    "Simulation or graph ingestion is still active; "
                     "wait for a terminal run status before generating a report"
                 ),
                 "ingestion_pending": updater is not None,
             }), 409
-        successful_terminal_statuses = {
+        # FAILED is accepted here (not just COMPLETED/STOPPED): a run that hit
+        # a terminal failure -- e.g. the graph drain failing because the LLM
+        # provider ran out of credits after all rounds already completed --
+        # still has real action-log data worth reporting on. The report is
+        # caveated (see _build_report_coverage below) rather than presented
+        # as if nothing were missing.
+        reportable_terminal_statuses = {
             RunnerStatus.COMPLETED,
             RunnerStatus.STOPPED,
+            RunnerStatus.FAILED,
         }
         if (
             run_state is None
-            or run_state.runner_status not in successful_terminal_statuses
+            or run_state.runner_status not in reportable_terminal_statuses
         ):
             return jsonify({
                 "success": False,
                 "error": (
-                    "A successfully completed or stopped simulation is required "
+                    "A completed, stopped, or failed simulation is required "
                     "before generating a report"
                 ),
             }), 409
@@ -190,7 +249,7 @@ def generate_report():
                 return jsonify({
                     "success": False,
                     "error": (
-                        "Simulation or Zep graph ingestion became active; "
+                        "Simulation or graph ingestion became active; "
                         "retry after it reaches a terminal state"
                     ),
                     "ingestion_pending": refreshed_updater is not None,
@@ -198,12 +257,12 @@ def generate_report():
             if (
                 refreshed_run_state is None
                 or refreshed_run_state.runner_status
-                not in successful_terminal_statuses
+                not in reportable_terminal_statuses
             ):
                 return jsonify({
                     "success": False,
                     "error": (
-                        "A successfully completed or stopped simulation is "
+                        "A completed, stopped, or failed simulation is "
                         "required before generating a report"
                     ),
                 }), 409
@@ -226,7 +285,8 @@ def generate_report():
                             "report_id": existing_report.report_id,
                             "status": "completed",
                             "message": t('api.reportAlreadyExists'),
-                            "already_generated": True
+                            "already_generated": True,
+                            **_build_report_coverage(simulation_id),
                         }
                     })
 
@@ -306,7 +366,8 @@ def generate_report():
                 "task_id": task_id,
                 "status": "generating",
                 "message": t('api.reportGenerateStarted'),
-                "already_generated": False
+                "already_generated": False,
+                **_build_report_coverage(simulation_id),
             }
         })
         
@@ -423,9 +484,12 @@ def get_report(report_id: str):
         
         return jsonify({
             "success": True,
-            "data": report.to_dict()
+            "data": {
+                **report.to_dict(),
+                **_build_report_coverage(report.simulation_id),
+            }
         })
-        
+
     except Exception as e:
         logger.error(f"获取报告失败: {str(e)}")
         return jsonify({
@@ -461,7 +525,10 @@ def get_report_by_simulation(simulation_id: str):
         
         return jsonify({
             "success": True,
-            "data": report.to_dict(),
+            "data": {
+                **report.to_dict(),
+                **_build_report_coverage(simulation_id),
+            },
             "has_report": True
         })
         

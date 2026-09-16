@@ -1,11 +1,12 @@
 """
 模拟相关API路由
-Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化）
+Step2: 图谱实体读取与过滤、OASIS模拟准备与运行（全程自动化）
 """
 
 import os
 import traceback
 from contextlib import nullcontext
+from typing import Any, Dict
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
@@ -19,6 +20,8 @@ from ..services.simulation_runner import (
     SimulationStopPending,
 )
 from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
+from ..services.graph_ingestion_journal import GraphIngestionJournal
+from ..utils.atomic_io import read_json_tolerant
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
 from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
@@ -87,12 +90,6 @@ def get_graph_entities(graph_id: str):
         enrich: 是否获取相关边信息（默认true）
     """
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
         entity_types_str = request.args.get('entity_types', '')
         entity_types = [t.strip() for t in entity_types_str.split(',') if t.strip()] if entity_types_str else None
         enrich = request.args.get('enrich', 'true').lower() == 'true'
@@ -124,12 +121,6 @@ def get_graph_entities(graph_id: str):
 def get_entity_detail(graph_id: str, entity_uuid: str):
     """获取单个实体的详细信息"""
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
         reader = ZepEntityReader()
         entity = reader.get_entity_with_context(graph_id, entity_uuid)
         
@@ -157,12 +148,6 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
 def get_entities_by_type(graph_id: str, entity_type: str):
     """获取指定类型的所有实体"""
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
         enrich = request.args.get('enrich', 'true').lower() == 'true'
         
         reader = ZepEntityReader()
@@ -401,7 +386,7 @@ def prepare_simulation():
     
     步骤：
     1. 检查是否已有完成的准备工作
-    2. 从Zep图谱读取并过滤实体
+    2. 从图谱读取并过滤实体
     3. 为每个实体生成OASIS Agent Profile（带重试机制）
     4. LLM智能生成模拟配置（带重试机制）
     5. 保存配置文件和预设脚本
@@ -1508,7 +1493,7 @@ def start_simulation():
             "simulation_id": "sim_xxxx",          // 必填，模拟ID
             "platform": "parallel",                // 可选: twitter / reddit / parallel (默认)
             "max_rounds": 100,                     // 可选: 最大模拟轮数，用于截断过长的模拟
-            "enable_graph_memory_update": false,   // 可选: 是否将Agent活动动态更新到Zep图谱记忆
+            "enable_graph_memory_update": false,   // 可选: 是否将Agent活动动态更新到图谱记忆
             "force": false                         // 可选: 强制重新开始（会停止运行中的模拟并清理日志）
         }
 
@@ -1519,7 +1504,7 @@ def start_simulation():
         - 适用于需要重新运行模拟的场景
 
     关于 enable_graph_memory_update：
-        - 启用后，模拟中所有Agent的活动（发帖、评论、点赞等）都会实时更新到Zep图谱
+        - 启用后，模拟中所有Agent的活动（发帖、评论、点赞等）都会实时更新到图谱
         - 这可以让图谱"记住"模拟过程，用于后续分析或AI对话
         - 需要模拟关联的项目有有效的 graph_id
         - 采用批量更新机制，减少API调用次数
@@ -1664,6 +1649,32 @@ def start_simulation():
                                 f"{cleanup_result.get('errors')}"
                             ),
                         }), 500
+
+                    # cleanup_simulation_logs only deletes local run-state
+                    # files (run_state.json, the sqlite dbs, logs) -- it
+                    # never touches the graph. The abandoned run already
+                    # streamed its agent activity into the project's graph
+                    # (same graph_id the new run will write to), so without
+                    # this, the new run's agents would carry memories of an
+                    # timeline that got abandoned rather than one they
+                    # actually lived through. Best-effort: a failure here
+                    # shouldn't block the restart, since the local state is
+                    # already clean and the user is deliberately restarting.
+                    abandoned_project = ProjectManager.get_project(state.project_id)
+                    abandoned_graph_id = (
+                        abandoned_project.graph_id if abandoned_project else None
+                    )
+                    if abandoned_graph_id:
+                        try:
+                            ZepGraphMemoryManager.clear_simulation_episodes(
+                                abandoned_graph_id, simulation_id
+                            )
+                        except Exception as error:
+                            logger.warning(
+                                f"清除已放弃模拟的图谱episode失败（继续重启）: "
+                                f"simulation_id={simulation_id}, error={error}"
+                            )
+
                     force_restarted = True
 
                 # 进程不存在或已结束，重置状态为 ready
@@ -1785,6 +1796,189 @@ def start_simulation():
         }), 500
 
 
+@simulation_bp.route('/resume', methods=['POST'])
+def resume_simulation():
+    """
+    从上一次中断的round断点续跑模拟（真正的round级断点续跑）
+
+    请求（JSON）：
+        {
+            "simulation_id": "sim_xxxx",          // 必填，模拟ID
+            "platform": "parallel",                // 可选: twitter / reddit / parallel (默认)，
+                                                    // 应与被中断的那次运行使用的平台一致
+            "max_rounds": 100,                     // 可选: 应与被中断的那次运行保持一致
+            "enable_graph_memory_update": false,   // 可选: 是否将Agent活动动态更新到图谱记忆
+        }
+
+    与 /start 的关键区别：
+        - 绝不清理/删除任何运行产物（sqlite数据库、actions.jsonl、图谱
+          摄取journal）——这些正是续跑所需要保留的状态，因此本接口不接受
+          也不识别 force 参数：resume 与"强制重新开始"是两个互斥的操作，
+          传 force 会被直接拒绝，以免调用方以为两者可以合并使用。
+        - 要求该模拟目录下已经存在一份有效的 round_checkpoint.json（由
+          此前一次运行在每一轮结束时写入），否则明确拒绝而不是悄悄从
+          round 0 重新开始。
+        - 只能在没有活跃运行（RUNNING/PAUSED/STOPPING/STARTING）的模拟
+          上调用——这一点由 SimulationRunner.start_simulation 内部既有的
+          原子状态检查保障，与 /start 完全一致。
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "simulation_id": "sim_xxxx",
+                "runner_status": "running",
+                "process_pid": 12345,
+                "twitter_running": true,
+                "reddit_running": true,
+                "started_at": "2025-12-01T10:00:00",
+                "resumed": true
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        # resume 与"强制重新开始"互斥：这里没有、也不能有清理运行产物的
+        # 代码路径，一旦调用方传了 force，直接拒绝而不是悄悄忽略它，
+        # 避免调用方误以为 force 在这个接口上也生效了。
+        if data.get('force'):
+            return jsonify({
+                "success": False,
+                "error": (
+                    "force is not supported on /resume -- resume and "
+                    "force-restart are mutually exclusive. Use /start "
+                    "with force=true to discard previous progress instead."
+                ),
+            }), 400
+
+        platform = data.get('platform', 'parallel')
+        max_rounds = data.get('max_rounds')
+        enable_graph_memory_update = data.get('enable_graph_memory_update', False)
+        if not isinstance(enable_graph_memory_update, bool):
+            return jsonify({
+                "success": False,
+                "error": "enable_graph_memory_update must be a JSON boolean",
+            }), 400
+
+        if max_rounds is not None:
+            try:
+                max_rounds = int(max_rounds)
+                if max_rounds <= 0:
+                    return jsonify({
+                        "success": False,
+                        "error": t('api.maxRoundsPositive')
+                    }), 400
+            except (ValueError, TypeError):
+                return jsonify({
+                    "success": False,
+                    "error": t('api.maxRoundsInvalid')
+                }), 400
+
+        if platform not in ['twitter', 'reddit', 'parallel']:
+            return jsonify({
+                "success": False,
+                "error": t('api.invalidPlatform', platform=platform)
+            }), 400
+
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+        if not state:
+            return jsonify({
+                "success": False,
+                "error": t('api.simulationNotFound', id=simulation_id)
+            }), 404
+
+        graph_id = None
+        if enable_graph_memory_update:
+            project = ProjectManager.get_project(state.project_id)
+            graph_id = project.graph_id if project else None
+            if not graph_id:
+                return jsonify({
+                    "success": False,
+                    "error": t('api.graphIdRequiredForMemory')
+                }), 400
+
+        graph_guard = (
+            graph_lifecycle_lock(graph_id)
+            if enable_graph_memory_update
+            else nullcontext()
+        )
+        with graph_guard:
+            if enable_graph_memory_update:
+                refreshed_state = manager.get_simulation(simulation_id)
+                refreshed_project = (
+                    ProjectManager.get_project(refreshed_state.project_id)
+                    if refreshed_state
+                    else None
+                )
+                current_graph_id = (
+                    refreshed_project.graph_id if refreshed_project else None
+                )
+                if current_graph_id != graph_id:
+                    return jsonify({
+                        "success": False,
+                        "error": (
+                            "The project graph changed while the resume "
+                            "request was in flight; retry after refreshing "
+                            "the project"
+                        ),
+                    }), 409
+                active_reports = get_graph_readers(graph_id)
+                if active_reports:
+                    return jsonify({
+                        "success": False,
+                        "error": (
+                            "A report is currently reading this graph; wait "
+                            "for report generation to finish before enabling "
+                            "graph memory updates"
+                        ),
+                        "active_reports": active_reports,
+                    }), 409
+
+            run_state = SimulationRunner.resume_simulation(
+                simulation_id=simulation_id,
+                platform=platform,
+                max_rounds=max_rounds,
+                enable_graph_memory_update=enable_graph_memory_update,
+                graph_id=graph_id,
+            )
+
+        response_data = run_state.to_dict()
+        if max_rounds:
+            response_data['max_rounds_applied'] = max_rounds
+        response_data['graph_memory_update_enabled'] = enable_graph_memory_update
+        response_data['resumed'] = True
+        if enable_graph_memory_update:
+            response_data['graph_id'] = graph_id
+
+        return jsonify({
+            "success": True,
+            "data": response_data
+        })
+
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+    except Exception as e:
+        logger.error(f"续跑模拟失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 @simulation_bp.route('/stop', methods=['POST'])
 def stop_simulation():
     """
@@ -1860,7 +2054,167 @@ def stop_simulation():
         }), 500
 
 
+@simulation_bp.route('/<simulation_id>/graph/retry-ingestion', methods=['POST'])
+def retry_graph_ingestion(simulation_id: str):
+    """
+    重试/完成一次被中断的图谱写入
+
+    适用场景：模拟已经完整跑完（或Agent活动已durable地写入
+    actions.jsonl），但图谱写入过程中被中断——例如LLM厂商余额耗尽、后端进程
+    被杀、笔记本电脑休眠——导致部分批次卡在"已写入日志、是否已进入图谱未知"
+    的模糊状态。本接口在问题修复后（例如更换了有效的LLM凭据）调用，完成剩余
+    的图谱写入，且不要求模拟子进程仍在运行——所有需要的数据都在
+    actions.jsonl 与 graph_ingestion/ 写前日志中。
+
+    请求：无需请求体，仅使用 URL 中的 simulation_id
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "pending_before": 2,       // 恢复前未确认的批次数
+                "resent": 1,                // 确认未进入图谱、已重新发送成功的批次数
+                "already_committed": 1,     // 确认之前其实已成功进入图谱（未重发）的批次数
+                "still_failed": 0,          // 仍然失败（如凭据依旧无效）的批次数
+                "tail_items_sent": 12       // 恢复后额外发现并发送的、此前从未被打包过的活动数
+            }
+        }
+
+    幂等性：可安全地重复调用——已提交的批次不会被重复发送，
+    仍处于失败状态的批次会保持失败，等待下一次调用重试。
+    """
+    try:
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+        if not state:
+            return jsonify({
+                "success": False,
+                "error": t('api.simulationNotFound', id=simulation_id)
+            }), 404
+
+        project = ProjectManager.get_project(state.project_id)
+        graph_id = project.graph_id if project else None
+        if not graph_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.graphIdRequiredForMemory')
+            }), 400
+
+        # This must run with no live updater for the simulation: a live
+        # updater owns its own in-process seq/cursor state and is the only
+        # writer resume_ingestion's single-writer journal assumption
+        # depends on. If one exists, it should be stopped (or the run left
+        # to finish) instead of racing it here.
+        if ZepGraphMemoryManager.get_updater(simulation_id) is not None:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "A graph memory updater is still active for this simulation; "
+                    "stop it (or let the run finish) before retrying ingestion"
+                ),
+            }), 409
+
+        with graph_lifecycle_lock(graph_id):
+            # Re-check under the lock: another request could have created a
+            # fresh updater, or started another retry, between the check
+            # above and acquiring the lock.
+            if ZepGraphMemoryManager.get_updater(simulation_id) is not None:
+                return jsonify({
+                    "success": False,
+                    "error": (
+                        "A graph memory updater is still active for this simulation; "
+                        "stop it (or let the run finish) before retrying ingestion"
+                    ),
+                }), 409
+
+            active_reports = get_graph_readers(graph_id)
+            if active_reports:
+                return jsonify({
+                    "success": False,
+                    "error": (
+                        "A report is currently reading this graph; wait for report "
+                        "generation to finish before retrying graph ingestion"
+                    ),
+                    "active_reports": active_reports,
+                }), 409
+
+            logger.info(
+                "开始重试图谱写入: simulation_id=%s, graph_id=%s",
+                simulation_id,
+                graph_id,
+            )
+            result = ZepGraphMemoryManager.resume_ingestion(simulation_id, graph_id)
+
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+
+    except Exception as e:
+        logger.error(f"重试图谱写入失败: simulation_id={simulation_id}, error={e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 # ============== 实时状态监控接口 ==============
+
+def _recovery_affordances(simulation_id: str) -> Dict[str, Any]:
+    """What recovery actions are actually available for this simulation.
+
+    The UI polls run-status every 2s and needs to decide, without guessing,
+    whether to offer "continue from round N" and/or "retry graph ingestion".
+    Both answers live on disk rather than in the run state: the round
+    checkpoint is written by the subprocess, and pending ingestion work is
+    whatever INTENT records have no matching COMMITTED. Neither is derivable
+    from `runner_status` alone -- a FAILED run may have both, one, or
+    neither -- so surface them explicitly instead of making the frontend
+    infer it.
+
+    Best-effort by design: a missing/corrupt checkpoint or journal means
+    "that recovery option isn't available", never a 500 on the status poll
+    the whole UI depends on.
+    """
+
+    affordances: Dict[str, Any] = {
+        "resume_available": False,
+        "resume_from_round": None,
+        "graph_ingestion_pending": 0,
+    }
+
+    sim_dir = os.path.join(SimulationRunner.RUN_STATE_DIR, simulation_id)
+
+    try:
+        checkpoint = read_json_tolerant(
+            os.path.join(sim_dir, "round_checkpoint.json"), default=None
+        )
+        if isinstance(checkpoint, dict):
+            # The resume point is the furthest-behind platform: resuming has
+            # to re-enter every platform that has rounds left, so the round
+            # worth showing the user is the minimum, not the maximum.
+            next_rounds = [
+                section.get("next_round_index")
+                for key, section in checkpoint.items()
+                if isinstance(section, dict)
+                and isinstance(section.get("next_round_index"), int)
+            ]
+            if next_rounds:
+                affordances["resume_available"] = True
+                affordances["resume_from_round"] = min(next_rounds)
+    except Exception as error:  # pragma: no cover - defensive
+        logger.debug(f"读取round_checkpoint失败（忽略）: {simulation_id}, {error}")
+
+    try:
+        journal = GraphIngestionJournal(sim_dir)
+        if os.path.exists(journal.path):
+            affordances["graph_ingestion_pending"] = len(journal.pending_intents())
+    except Exception as error:  # pragma: no cover - defensive
+        logger.debug(f"读取图谱写入journal失败（忽略）: {simulation_id}, {error}")
+
+    return affordances
+
 
 @simulation_bp.route('/<simulation_id>/run-status', methods=['GET'])
 def get_run_status(simulation_id: str):
@@ -1903,12 +2257,16 @@ def get_run_status(simulation_id: str):
                     "twitter_actions_count": 0,
                     "reddit_actions_count": 0,
                     "total_actions_count": 0,
+                    **_recovery_affordances(simulation_id),
                 }
             })
-        
+
         return jsonify({
             "success": True,
-            "data": run_state.to_dict()
+            "data": {
+                **run_state.to_dict(),
+                **_recovery_affordances(simulation_id),
+            }
         })
         
     except Exception as e:

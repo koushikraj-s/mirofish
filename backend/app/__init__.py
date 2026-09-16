@@ -3,6 +3,7 @@ MiroFish Backend - Flask应用工厂
 """
 
 import os
+import re
 import warnings
 
 # 抑制 multiprocessing resource_tracker 的警告（来自第三方库如 transformers）
@@ -47,6 +48,23 @@ def create_app(config_class=Config):
     SimulationRunner.register_cleanup()
     if should_log_startup:
         logger.info("已注册模拟进程清理函数")
+
+    # 启动自检：调解因后端重启而遗留为孤儿的模拟运行状态（复用上面已有的
+    # reloader判断，避免debug模式下的reloader父进程和子进程各扫描一次——
+    # 父进程扫描到的孤儿进程有可能正是子进程刚刚启动的模拟）
+    if should_log_startup:
+        try:
+            reconcile_result = SimulationRunner.reconcile_on_boot()
+            logger.info(
+                "模拟运行状态启动自检: scanned=%s, reconciled=%s, "
+                "skipped_terminal=%s, errors=%s",
+                reconcile_result.get("scanned"),
+                reconcile_result.get("reconciled"),
+                reconcile_result.get("skipped_terminal"),
+                len(reconcile_result.get("errors") or []),
+            )
+        except Exception as error:
+            logger.error(f"模拟运行状态启动自检失败: {error}")
     
     # 请求日志中间件
     @app.before_request
@@ -54,7 +72,33 @@ def create_app(config_class=Config):
         logger = get_logger('mirofish.request')
         logger.debug(f"请求: {request.method} {request.path}")
         if request.content_type and 'json' in request.content_type:
-            logger.debug(f"请求体: {request.get_json(silent=True)}")
+            # Generic, key-name-based secret redaction: matches any dict key
+            # ending in _key/_password/_secret/_token (case-insensitive),
+            # recursively, so it protects every current and future JSON
+            # endpoint -- not just an allowlist of known-sensitive paths
+            # like /api/settings. Without this, PUT /api/settings would
+            # write LLM/Neo4j credentials to backend/logs/*.log in
+            # cleartext at DEBUG level on every request.
+            sensitive_key_pattern = re.compile(
+                r'(_key|_password|_secret|_token)$', re.IGNORECASE
+            )
+
+            def redact_sensitive(value):
+                if isinstance(value, dict):
+                    return {
+                        k: (
+                            '***REDACTED***'
+                            if isinstance(k, str) and sensitive_key_pattern.search(k)
+                            else redact_sensitive(v)
+                        )
+                        for k, v in value.items()
+                    }
+                if isinstance(value, list):
+                    return [redact_sensitive(item) for item in value]
+                return value
+
+            body = request.get_json(silent=True)
+            logger.debug(f"请求体: {redact_sensitive(body)}")
     
     @app.after_request
     def log_response(response):
@@ -63,10 +107,11 @@ def create_app(config_class=Config):
         return response
     
     # 注册蓝图
-    from .api import graph_bp, simulation_bp, report_bp
+    from .api import graph_bp, simulation_bp, report_bp, settings_bp
     app.register_blueprint(graph_bp, url_prefix='/api/graph')
     app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
     app.register_blueprint(report_bp, url_prefix='/api/report')
+    app.register_blueprint(settings_bp, url_prefix='/api/settings')
     
     # 健康检查
     @app.route('/health')

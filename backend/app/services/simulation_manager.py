@@ -14,6 +14,7 @@ from enum import Enum
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.atomic_io import atomic_write_json, read_json_tolerant
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
@@ -130,7 +131,7 @@ class SimulationManager:
     模拟管理器
     
     核心功能：
-    1. 从Zep图谱读取实体并过滤
+    1. 从图谱读取实体并过滤
     2. 生成OASIS Agent Profile
     3. 使用LLM智能生成模拟配置参数
     4. 准备预设脚本所需的所有文件
@@ -156,51 +157,69 @@ class SimulationManager:
         return sim_dir
     
     def _save_simulation_state(self, state: SimulationState):
-        """保存模拟状态到文件"""
+        """保存模拟状态到文件
+
+        使用atomic_write_json而不是直接open(...).write(...)：一次kill -9
+        或进程崩溃恰好落在写入中途，就会把state.json截断成半个JSON文档，
+        而_load_simulation_state此前对此没有任何容错，会直接抛出异常。
+        """
         sim_dir = self._get_simulation_dir(state.simulation_id)
         state_file = os.path.join(sim_dir, "state.json")
-        
+
         state.updated_at = datetime.now().isoformat()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
-        
+
+        atomic_write_json(state_file, state.to_dict(), mode=0o644)
+
         self._simulations[state.simulation_id] = state
-    
+
     def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
-        """从文件加载模拟状态"""
+        """从文件加载模拟状态
+
+        使用read_json_tolerant容忍缺失/空/中途被截断的state.json：与
+        SimulationRunner._load_run_state保持相同的"宁可返回None，也不能
+        让一次意外的部分写入使整个后端抛出异常"的容错策略——此前这里是
+        run_state.json/state.json两者中唯一一个会在损坏时直接崩溃的读取路径。
+        """
         if simulation_id in self._simulations:
             return self._simulations[simulation_id]
-        
+
         sim_dir = self._get_simulation_dir(simulation_id)
         state_file = os.path.join(sim_dir, "state.json")
-        
-        if not os.path.exists(state_file):
+
+        data = read_json_tolerant(state_file, default=None)
+        if data is None:
             return None
-        
-        with open(state_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        state = SimulationState(
-            simulation_id=simulation_id,
-            project_id=data.get("project_id", ""),
-            graph_id=data.get("graph_id", ""),
-            enable_twitter=data.get("enable_twitter", True),
-            enable_reddit=data.get("enable_reddit", True),
-            status=SimulationStatus(data.get("status", "created")),
-            entities_count=data.get("entities_count", 0),
-            profiles_count=data.get("profiles_count", 0),
-            entity_types=data.get("entity_types", []),
-            profiles_generated=data.get("profiles_generated", False),
-            config_generated=data.get("config_generated", False),
-            config_reasoning=data.get("config_reasoning", ""),
-            current_round=data.get("current_round", 0),
-            twitter_status=data.get("twitter_status", "not_started"),
-            reddit_status=data.get("reddit_status", "not_started"),
-            created_at=data.get("created_at", datetime.now().isoformat()),
-            updated_at=data.get("updated_at", datetime.now().isoformat()),
-            error=data.get("error"),
-        )
+
+        # read_json_tolerant only guarantees *valid JSON*, not that it is a
+        # dict shaped like our schema (a corrupt-but-still-parseable file
+        # could legitimately decode to e.g. a JSON array or a bare string).
+        # Guard the construction itself so any such shape mismatch degrades
+        # to "no state" instead of raising, matching
+        # SimulationRunner._load_run_state's tolerance contract.
+        try:
+            state = SimulationState(
+                simulation_id=simulation_id,
+                project_id=data.get("project_id", ""),
+                graph_id=data.get("graph_id", ""),
+                enable_twitter=data.get("enable_twitter", True),
+                enable_reddit=data.get("enable_reddit", True),
+                status=SimulationStatus(data.get("status", "created")),
+                entities_count=data.get("entities_count", 0),
+                profiles_count=data.get("profiles_count", 0),
+                entity_types=data.get("entity_types", []),
+                profiles_generated=data.get("profiles_generated", False),
+                config_generated=data.get("config_generated", False),
+                config_reasoning=data.get("config_reasoning", ""),
+                current_round=data.get("current_round", 0),
+                twitter_status=data.get("twitter_status", "not_started"),
+                reddit_status=data.get("reddit_status", "not_started"),
+                created_at=data.get("created_at", datetime.now().isoformat()),
+                updated_at=data.get("updated_at", datetime.now().isoformat()),
+                error=data.get("error"),
+            )
+        except Exception as e:
+            logger.error(f"加载模拟状态失败: simulation_id={simulation_id}, error={str(e)}")
+            return None
         
         self._simulations[simulation_id] = state
         return state
@@ -217,7 +236,7 @@ class SimulationManager:
         
         Args:
             project_id: 项目ID
-            graph_id: Zep图谱ID
+            graph_id: 图谱ID
             enable_twitter: 是否启用Twitter模拟
             enable_reddit: 是否启用Reddit模拟
             
@@ -255,7 +274,7 @@ class SimulationManager:
         准备模拟环境（全程自动化）
         
         步骤：
-        1. 从Zep图谱读取并过滤实体
+        1. 从图谱读取并过滤实体
         2. 为每个实体生成OASIS Agent Profile（可选LLM增强，支持并行）
         3. 使用LLM智能生成模拟配置参数（时间、活跃度、发言频率等）
         4. 保存配置文件和Profile文件
@@ -289,7 +308,7 @@ class SimulationManager:
             
             # ========== 阶段1: 读取并过滤实体 ==========
             if progress_callback:
-                progress_callback("reading", 0, t('progress.connectingZepGraph'))
+                progress_callback("reading", 0, t('progress.connectingGraph'))
             
             reader = ZepEntityReader()
             
@@ -330,7 +349,7 @@ class SimulationManager:
                     total=total_entities
                 )
             
-            # 传入graph_id以启用Zep检索功能，获取更丰富的上下文
+            # 传入graph_id以启用图谱检索功能，获取更丰富的上下文
             generator = OasisProfileGenerator(graph_id=state.graph_id)
             
             def profile_progress(current, total, msg):
@@ -358,7 +377,7 @@ class SimulationManager:
                 entities=filtered.entities,
                 use_llm=use_llm_for_profiles,
                 progress_callback=profile_progress,
-                graph_id=state.graph_id,  # 传入graph_id用于Zep检索
+                graph_id=state.graph_id,  # 传入graph_id用于图谱检索
                 parallel_count=parallel_profile_count,  # 并行生成数量
                 realtime_output_path=realtime_output_path,  # 实时保存路径
                 output_platform=realtime_platform  # 输出格式
@@ -439,10 +458,10 @@ class SimulationManager:
                     total=3
                 )
             
-            # 保存配置文件
+            # 保存配置文件（atomic_write_json：避免中途kill导致该文件被截断，
+            # 该文件在start_simulation中被读取，损坏会直接阻止模拟启动）
             config_path = os.path.join(sim_dir, "simulation_config.json")
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.write(sim_params.to_json())
+            atomic_write_json(config_path, sim_params.to_dict(), mode=0o644)
             
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
