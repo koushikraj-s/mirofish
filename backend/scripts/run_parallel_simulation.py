@@ -73,7 +73,7 @@ import random
 import signal
 import sqlite3
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
 
@@ -156,6 +156,20 @@ def init_logging_for_simulation(simulation_dir: str):
 
 
 from action_logger import SimulationLogManager, PlatformActionLogger
+from action_db import get_agent_names_from_config, fetch_new_actions_from_db
+from round_checkpoint import (
+    CHECKPOINT_FILENAME,
+    CHECKPOINT_SCHEMA_VERSION,
+    load_resume_state,
+    write_round_checkpoint,
+    clear_checkpoint_platform_section,
+    _db_schema_is_complete,
+)
+from credentials_reload import (
+    CREDENTIALS_RELOAD_FILENAME,
+    _apply_credentials_reload,
+    _poll_and_apply_credentials_reload,
+)
 
 try:
     from camel.models import ModelFactory
@@ -165,9 +179,15 @@ try:
         ActionType,
         LLMAction,
         ManualAction,
+        Platform,
         generate_twitter_agent_graph,
         generate_reddit_agent_graph
     )
+    # Platform/Clock/Channel 组合用于 Reddit 断点续跑的时钟连续性修复（见
+    # write_round_checkpoint / load_resume_state 附近的说明）。oasis 顶层包
+    # 没有重新导出 Clock 和 Channel，因此直接从子模块导入。
+    from oasis.clock.clock import Clock
+    from oasis.social_platform.channel import Channel
 except ImportError as e:
     print(f"错误: 缺少依赖 {e}")
     print("请先安装: pip install oasis-ai camel-ai")
@@ -607,380 +627,6 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-# 需要过滤掉的非核心动作类型（这些动作对分析价值较低）
-FILTERED_ACTIONS = {'refresh', 'sign_up'}
-
-# 动作类型映射表（数据库中的名称 -> 标准名称）
-ACTION_TYPE_MAP = {
-    'create_post': 'CREATE_POST',
-    'like_post': 'LIKE_POST',
-    'dislike_post': 'DISLIKE_POST',
-    'repost': 'REPOST',
-    'quote_post': 'QUOTE_POST',
-    'follow': 'FOLLOW',
-    'mute': 'MUTE',
-    'create_comment': 'CREATE_COMMENT',
-    'like_comment': 'LIKE_COMMENT',
-    'dislike_comment': 'DISLIKE_COMMENT',
-    'search_posts': 'SEARCH_POSTS',
-    'search_user': 'SEARCH_USER',
-    'trend': 'TREND',
-    'do_nothing': 'DO_NOTHING',
-    'interview': 'INTERVIEW',
-}
-
-
-def get_agent_names_from_config(config: Dict[str, Any]) -> Dict[int, str]:
-    """
-    从 simulation_config 中获取 agent_id -> entity_name 的映射
-    
-    这样可以在 actions.jsonl 中显示真实的实体名称，而不是 "Agent_0" 这样的代号
-    
-    Args:
-        config: simulation_config.json 的内容
-        
-    Returns:
-        agent_id -> entity_name 的映射字典
-    """
-    agent_names = {}
-    agent_configs = config.get("agent_configs", [])
-    
-    for agent_config in agent_configs:
-        agent_id = agent_config.get("agent_id")
-        entity_name = agent_config.get("entity_name", f"Agent_{agent_id}")
-        if agent_id is not None:
-            agent_names[agent_id] = entity_name
-    
-    return agent_names
-
-
-def fetch_new_actions_from_db(
-    db_path: str,
-    last_rowid: int,
-    agent_names: Dict[int, str]
-) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    从数据库中获取新的动作记录，并补充完整的上下文信息
-    
-    Args:
-        db_path: 数据库文件路径
-        last_rowid: 上次读取的最大 rowid 值（使用 rowid 而不是 created_at，因为不同平台的 created_at 格式不同）
-        agent_names: agent_id -> agent_name 映射
-        
-    Returns:
-        (actions_list, new_last_rowid)
-        - actions_list: 动作列表，每个元素包含 agent_id, agent_name, action_type, action_args（含上下文信息）
-        - new_last_rowid: 新的最大 rowid 值
-    """
-    actions = []
-    new_last_rowid = last_rowid
-    
-    if not os.path.exists(db_path):
-        return actions, new_last_rowid
-    
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # 使用 rowid 来追踪已处理的记录（rowid 是 SQLite 的内置自增字段）
-        # 这样可以避免 created_at 格式差异问题（Twitter 用整数，Reddit 用日期时间字符串）
-        cursor.execute("""
-            SELECT rowid, user_id, action, info
-            FROM trace
-            WHERE rowid > ?
-            ORDER BY rowid ASC
-        """, (last_rowid,))
-        
-        for rowid, user_id, action, info_json in cursor.fetchall():
-            # 更新最大 rowid
-            new_last_rowid = rowid
-            
-            # 过滤非核心动作
-            if action in FILTERED_ACTIONS:
-                continue
-            
-            # 解析动作参数
-            try:
-                action_args = json.loads(info_json) if info_json else {}
-            except json.JSONDecodeError:
-                action_args = {}
-            
-            # 精简 action_args，只保留关键字段（保留完整内容，不截断）
-            simplified_args = {}
-            if 'content' in action_args:
-                simplified_args['content'] = action_args['content']
-            if 'post_id' in action_args:
-                simplified_args['post_id'] = action_args['post_id']
-            if 'comment_id' in action_args:
-                simplified_args['comment_id'] = action_args['comment_id']
-            if 'quoted_id' in action_args:
-                simplified_args['quoted_id'] = action_args['quoted_id']
-            if 'new_post_id' in action_args:
-                simplified_args['new_post_id'] = action_args['new_post_id']
-            if 'follow_id' in action_args:
-                simplified_args['follow_id'] = action_args['follow_id']
-            if 'query' in action_args:
-                simplified_args['query'] = action_args['query']
-            if 'like_id' in action_args:
-                simplified_args['like_id'] = action_args['like_id']
-            if 'dislike_id' in action_args:
-                simplified_args['dislike_id'] = action_args['dislike_id']
-            
-            # 转换动作类型名称
-            action_type = ACTION_TYPE_MAP.get(action, action.upper())
-            
-            # 补充上下文信息（帖子内容、用户名等）
-            _enrich_action_context(cursor, action_type, simplified_args, agent_names)
-            
-            actions.append({
-                'agent_id': user_id,
-                'agent_name': agent_names.get(user_id, f'Agent_{user_id}'),
-                'action_type': action_type,
-                'action_args': simplified_args,
-            })
-        
-        conn.close()
-    except Exception as e:
-        print(f"读取数据库动作失败: {e}")
-    
-    return actions, new_last_rowid
-
-
-def _enrich_action_context(
-    cursor,
-    action_type: str,
-    action_args: Dict[str, Any],
-    agent_names: Dict[int, str]
-) -> None:
-    """
-    为动作补充上下文信息（帖子内容、用户名等）
-    
-    Args:
-        cursor: 数据库游标
-        action_type: 动作类型
-        action_args: 动作参数（会被修改）
-        agent_names: agent_id -> agent_name 映射
-    """
-    try:
-        # 点赞/踩帖子：补充帖子内容和作者
-        if action_type in ('LIKE_POST', 'DISLIKE_POST'):
-            post_id = action_args.get('post_id')
-            if post_id:
-                post_info = _get_post_info(cursor, post_id, agent_names)
-                if post_info:
-                    action_args['post_content'] = post_info.get('content', '')
-                    action_args['post_author_name'] = post_info.get('author_name', '')
-        
-        # 转发帖子：补充原帖内容和作者
-        elif action_type == 'REPOST':
-            new_post_id = action_args.get('new_post_id')
-            if new_post_id:
-                # 转发帖子的 original_post_id 指向原帖
-                cursor.execute("""
-                    SELECT original_post_id FROM post WHERE post_id = ?
-                """, (new_post_id,))
-                row = cursor.fetchone()
-                if row and row[0]:
-                    original_post_id = row[0]
-                    original_info = _get_post_info(cursor, original_post_id, agent_names)
-                    if original_info:
-                        action_args['original_content'] = original_info.get('content', '')
-                        action_args['original_author_name'] = original_info.get('author_name', '')
-        
-        # 引用帖子：补充原帖内容、作者和引用评论
-        elif action_type == 'QUOTE_POST':
-            quoted_id = action_args.get('quoted_id')
-            new_post_id = action_args.get('new_post_id')
-            
-            if quoted_id:
-                original_info = _get_post_info(cursor, quoted_id, agent_names)
-                if original_info:
-                    action_args['original_content'] = original_info.get('content', '')
-                    action_args['original_author_name'] = original_info.get('author_name', '')
-            
-            # 获取引用帖子的评论内容（quote_content）
-            if new_post_id:
-                cursor.execute("""
-                    SELECT quote_content FROM post WHERE post_id = ?
-                """, (new_post_id,))
-                row = cursor.fetchone()
-                if row and row[0]:
-                    action_args['quote_content'] = row[0]
-        
-        # 关注用户：补充被关注用户的名称
-        elif action_type == 'FOLLOW':
-            follow_id = action_args.get('follow_id')
-            if follow_id:
-                # 从 follow 表获取 followee_id
-                cursor.execute("""
-                    SELECT followee_id FROM follow WHERE follow_id = ?
-                """, (follow_id,))
-                row = cursor.fetchone()
-                if row:
-                    followee_id = row[0]
-                    target_name = _get_user_name(cursor, followee_id, agent_names)
-                    if target_name:
-                        action_args['target_user_name'] = target_name
-        
-        # 屏蔽用户：补充被屏蔽用户的名称
-        elif action_type == 'MUTE':
-            # 从 action_args 中获取 user_id 或 target_id
-            target_id = action_args.get('user_id') or action_args.get('target_id')
-            if target_id:
-                target_name = _get_user_name(cursor, target_id, agent_names)
-                if target_name:
-                    action_args['target_user_name'] = target_name
-        
-        # 点赞/踩评论：补充评论内容和作者
-        elif action_type in ('LIKE_COMMENT', 'DISLIKE_COMMENT'):
-            comment_id = action_args.get('comment_id')
-            if comment_id:
-                comment_info = _get_comment_info(cursor, comment_id, agent_names)
-                if comment_info:
-                    action_args['comment_content'] = comment_info.get('content', '')
-                    action_args['comment_author_name'] = comment_info.get('author_name', '')
-        
-        # 发表评论：补充所评论的帖子信息
-        elif action_type == 'CREATE_COMMENT':
-            post_id = action_args.get('post_id')
-            if post_id:
-                post_info = _get_post_info(cursor, post_id, agent_names)
-                if post_info:
-                    action_args['post_content'] = post_info.get('content', '')
-                    action_args['post_author_name'] = post_info.get('author_name', '')
-    
-    except Exception as e:
-        # 补充上下文失败不影响主流程
-        print(f"补充动作上下文失败: {e}")
-
-
-def _get_post_info(
-    cursor,
-    post_id: int,
-    agent_names: Dict[int, str]
-) -> Optional[Dict[str, str]]:
-    """
-    获取帖子信息
-    
-    Args:
-        cursor: 数据库游标
-        post_id: 帖子ID
-        agent_names: agent_id -> agent_name 映射
-        
-    Returns:
-        包含 content 和 author_name 的字典，或 None
-    """
-    try:
-        cursor.execute("""
-            SELECT p.content, p.user_id, u.agent_id
-            FROM post p
-            LEFT JOIN user u ON p.user_id = u.user_id
-            WHERE p.post_id = ?
-        """, (post_id,))
-        row = cursor.fetchone()
-        if row:
-            content = row[0] or ''
-            user_id = row[1]
-            agent_id = row[2]
-            
-            # 优先使用 agent_names 中的名称
-            author_name = ''
-            if agent_id is not None and agent_id in agent_names:
-                author_name = agent_names[agent_id]
-            elif user_id:
-                # 从 user 表获取名称
-                cursor.execute("SELECT name, user_name FROM user WHERE user_id = ?", (user_id,))
-                user_row = cursor.fetchone()
-                if user_row:
-                    author_name = user_row[0] or user_row[1] or ''
-            
-            return {'content': content, 'author_name': author_name}
-    except Exception:
-        pass
-    return None
-
-
-def _get_user_name(
-    cursor,
-    user_id: int,
-    agent_names: Dict[int, str]
-) -> Optional[str]:
-    """
-    获取用户名称
-    
-    Args:
-        cursor: 数据库游标
-        user_id: 用户ID
-        agent_names: agent_id -> agent_name 映射
-        
-    Returns:
-        用户名称，或 None
-    """
-    try:
-        cursor.execute("""
-            SELECT agent_id, name, user_name FROM user WHERE user_id = ?
-        """, (user_id,))
-        row = cursor.fetchone()
-        if row:
-            agent_id = row[0]
-            name = row[1]
-            user_name = row[2]
-            
-            # 优先使用 agent_names 中的名称
-            if agent_id is not None and agent_id in agent_names:
-                return agent_names[agent_id]
-            return name or user_name or ''
-    except Exception:
-        pass
-    return None
-
-
-def _get_comment_info(
-    cursor,
-    comment_id: int,
-    agent_names: Dict[int, str]
-) -> Optional[Dict[str, str]]:
-    """
-    获取评论信息
-    
-    Args:
-        cursor: 数据库游标
-        comment_id: 评论ID
-        agent_names: agent_id -> agent_name 映射
-        
-    Returns:
-        包含 content 和 author_name 的字典，或 None
-    """
-    try:
-        cursor.execute("""
-            SELECT c.content, c.user_id, u.agent_id
-            FROM comment c
-            LEFT JOIN user u ON c.user_id = u.user_id
-            WHERE c.comment_id = ?
-        """, (comment_id,))
-        row = cursor.fetchone()
-        if row:
-            content = row[0] or ''
-            user_id = row[1]
-            agent_id = row[2]
-            
-            # 优先使用 agent_names 中的名称
-            author_name = ''
-            if agent_id is not None and agent_id in agent_names:
-                author_name = agent_names[agent_id]
-            elif user_id:
-                # 从 user 表获取名称
-                cursor.execute("SELECT name, user_name FROM user WHERE user_id = ?", (user_id,))
-                user_row = cursor.fetchone()
-                if user_row:
-                    author_name = user_row[0] or user_row[1] or ''
-            
-            return {'content': content, 'author_name': author_name}
-    except Exception:
-        pass
-    return None
-
-
 def create_model(config: Dict[str, Any], use_boost: bool = False):
     """
     创建LLM模型
@@ -1041,44 +687,60 @@ def get_active_agents_for_round(
     env,
     config: Dict[str, Any],
     current_hour: int,
-    round_num: int
+    round_num: int,
+    simulation_id: str,
+    platform: str,
 ) -> List:
-    """根据时间和配置决定本轮激活哪些Agent"""
+    """根据时间和配置决定本轮激活哪些Agent
+
+    Args:
+        simulation_id, platform, round_num: 共同构成本轮RNG的确定性种子
+            "{simulation_id}:{platform}:{round_num}"。此前这里用的是模块级
+            未播种的 random，导致同一个round重复执行两次（例如一次真正的
+            续跑，或者未来任何形式的重试）永远无法选出同一批活跃agent——
+            模拟从来都不可复现。改成每轮独立播种的 random.Random 之后：
+            1) 同一个round_num总能确定性地选出同一批agent，résumé之后的
+               主循环和"假如从未被打断"完全一致；
+            2) 各round之间仍然互相独立随机（种子里带了round_num），不会
+               因为播种而失去轮次间的随机性。
+    """
+    rng = random.Random(f"{simulation_id}:{platform}:{round_num}")
+
     time_config = config.get("time_config", {})
     agent_configs = config.get("agent_configs", [])
-    
+
     base_min = time_config.get("agents_per_hour_min", 5)
     base_max = time_config.get("agents_per_hour_max", 20)
-    
+
     peak_hours = time_config.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22])
     off_peak_hours = time_config.get("off_peak_hours", [0, 1, 2, 3, 4, 5])
-    
+
     if current_hour in peak_hours:
         multiplier = time_config.get("peak_activity_multiplier", 1.5)
     elif current_hour in off_peak_hours:
         multiplier = time_config.get("off_peak_activity_multiplier", 0.3)
     else:
         multiplier = 1.0
-    
-    target_count = int(random.uniform(base_min, base_max) * multiplier)
-    
+
+    target_count = int(rng.uniform(base_min, base_max) * multiplier)
+
     candidates = []
     for cfg in agent_configs:
         agent_id = cfg.get("agent_id", 0)
         active_hours = cfg.get("active_hours", list(range(8, 23)))
         activity_level = cfg.get("activity_level", 0.5)
-        
+
         if current_hour not in active_hours:
             continue
-        
-        if random.random() < activity_level:
+
+        if rng.random() < activity_level:
             candidates.append(agent_id)
-    
-    selected_ids = random.sample(
-        candidates, 
+
+    selected_ids = rng.sample(
+        candidates,
         min(target_count, len(candidates))
     ) if candidates else []
-    
+
     active_agents = []
     for agent_id in selected_ids:
         try:
@@ -1086,7 +748,7 @@ def get_active_agents_for_round(
             active_agents.append((agent_id, agent))
         except Exception:
             pass
-    
+
     return active_agents
 
 
@@ -1099,165 +761,256 @@ class PlatformSimulation:
 
 
 async def run_twitter_simulation(
-    config: Dict[str, Any], 
+    config: Dict[str, Any],
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    resume: bool = False,
 ) -> PlatformSimulation:
     """运行Twitter模拟
-    
+
     Args:
         config: 模拟配置
         simulation_dir: 模拟目录
         action_logger: 动作日志记录器
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
-        
+        resume: 是否从 round_checkpoint.json 记录的断点续跑（跳过数据库
+            删除和初始事件播种，从上次记录的round继续，并恢复last_rowid/
+            总动作数）。Twitter 不需要 Reddit 那样的时钟连续性修复——它的
+            trace created_at 用的是 sandbox_clock.time_step（一个每次
+            env.step()递增的整数计数器），续跑时从0重新计数即可，不影响
+            正确性，只是不再全局单调（这是有意的取舍，见任务说明）。
+
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
     result = PlatformSimulation()
-    
+
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Twitter] {msg}")
         print(f"[Twitter] {msg}")
-    
+
     log_info("初始化...")
-    
+
+    simulation_id = config.get("simulation_id", "unknown")
+
+    db_path = os.path.join(simulation_dir, "twitter_simulation.db")
+
+    # ---- Gated site 1: 续跑校验（必须在做任何昂贵的工作之前尽早失败）----
+    resume_state = {
+        "found": False, "start_round": 0, "last_rowid": 0, "total_actions": 0,
+        "original_start_time": None,
+    }
+    if resume:
+        resume_state = load_resume_state(simulation_dir, "twitter")
+        if not resume_state["found"]:
+            log_info(
+                "错误: 请求续跑(--resume)但未在 round_checkpoint.json 中找到 "
+                "twitter 平台的记录，拒绝继续（避免跳过初始事件播种或在空"
+                "数据库上运行）。请改用强制重新开始。"
+            )
+            return result
+        if not _db_schema_is_complete(db_path):
+            log_info(
+                f"错误: 数据库表结构不完整，拒绝在此基础上续跑: {db_path}"
+            )
+            return result
+        log_info(
+            f"续跑模式: 从 round {resume_state['start_round']} 开始，"
+            f"last_rowid={resume_state['last_rowid']}, "
+            f"已记录动作数={resume_state['total_actions']}"
+        )
+
     # Twitter 使用通用 LLM 配置
     model = create_model(config, use_boost=False)
-    
+
     # OASIS Twitter使用CSV格式
     profile_path = os.path.join(simulation_dir, "twitter_profiles.csv")
     if not os.path.exists(profile_path):
         log_info(f"错误: Profile文件不存在: {profile_path}")
         return result
-    
+
     result.agent_graph = await generate_twitter_agent_graph(
         profile_path=profile_path,
         model=model,
         available_actions=TWITTER_ACTIONS,
     )
-    
+
     # 从配置文件获取 Agent 真实名称映射（使用 entity_name 而非默认的 Agent_X）
     agent_names = get_agent_names_from_config(config)
     # 如果配置中没有某个 agent，则使用 OASIS 的默认名称
     for agent_id, agent in result.agent_graph.get_agents():
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
-    
-    db_path = os.path.join(simulation_dir, "twitter_simulation.db")
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    
+
+    # ---- Gated site 2: 数据库删除（resume时必须保留，否则等于从头开始）----
+    if not resume:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        await clear_checkpoint_platform_section(simulation_dir, "twitter")
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.TWITTER,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
+
+    # env.reset() 保持无条件执行：它重启 platform.running() 消息循环，并
+    # 重新signup所有agent——针对一个保留下来的数据库重跑sign_up是安全
+    # 的，oasis Platform.sign_up 把 INSERT INTO user 包在
+    # try/except Exception 里，失败(主键冲突)只会返回
+    # {"success": False}，绝不抛异常，也不会在 sign_up 失败时写入重复的
+    # SIGNUP trace行（_record_trace 在返回之后才会执行）。
     await result.env.reset()
     log_info("环境已启动")
-    
+
     if action_logger:
         action_logger.log_simulation_start(config)
-    
-    total_actions = 0
-    last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
-    
-    # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
-    initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
-            try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                initial_actions[agent] = ManualAction(
-                    action_type=ActionType.CREATE_POST,
-                    action_args={"content": content}
-                )
-                
-                if action_logger:
-                    action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
+
+    original_start_time = resume_state["original_start_time"] or datetime.now()
+    total_actions = resume_state["total_actions"] if resume else 0
+    # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）。
+    # resume时必须从checkpoint恢复——这是整个续跑机制里最重要的一步：
+    # 不恢复的话 fetch_new_actions_from_db 会把保留数据库里全部历史trace
+    # 行都当成"新动作"重新写入actions.jsonl，污染UI动作流和图谱摄取源。
+    last_rowid = resume_state["last_rowid"] if resume else 0
+
+    # ---- Gated site 3: 初始事件播种（resume时必须跳过，否则重复发帖）----
+    if not resume:
+        event_config = config.get("event_config", {})
+        initial_posts = event_config.get("initial_posts", [])
+
+        # 记录 round 0 开始（初始事件阶段）
+        if action_logger:
+            action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+
+        initial_action_count = 0
+        if initial_posts:
+            initial_actions = {}
+            for post in initial_posts:
+                agent_id = post.get("poster_agent_id", 0)
+                content = post.get("content", "")
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
+                    initial_actions[agent] = ManualAction(
+                        action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception:
-                pass
-        
-        if initial_actions:
-            await result.env.step(initial_actions)
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
-    # 记录 round 0 结束
-    if action_logger:
-        action_logger.log_round_end(0, initial_action_count)
-    
+
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=0,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="CREATE_POST",
+                            action_args={"content": content}
+                        )
+                        total_actions += 1
+                        initial_action_count += 1
+                except Exception:
+                    pass
+
+            if initial_actions:
+                await result.env.step(initial_actions)
+                log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+
+        # 记录 round 0 结束
+        if action_logger:
+            action_logger.log_round_end(0, initial_action_count)
+
+        # round 0（初始事件轮）跑完，落一次checkpoint：如果接下来主循环
+        # 还没开始就被杀死，续跑时知道初始事件已经做过，不需要重新播种。
+        await write_round_checkpoint(
+            simulation_dir, "twitter",
+            next_round_index=0,
+            last_rowid=last_rowid,
+            total_actions=total_actions,
+            original_start_time=original_start_time,
+        )
+    else:
+        log_info("续跑模式: 跳过初始事件播种（round 0 已在上次运行中完成）")
+
     # 主模拟循环
     time_config = config.get("time_config", {})
     total_hours = time_config.get("total_simulation_hours", 72)
     minutes_per_round = time_config.get("minutes_per_round", 30)
     total_rounds = (total_hours * 60) // minutes_per_round
-    
+
     # 如果指定了最大轮数，则截断
     if max_rounds is not None and max_rounds > 0:
         original_rounds = total_rounds
         total_rounds = min(total_rounds, max_rounds)
         if total_rounds < original_rounds:
             log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
+
+    # ---- Gated site 4: 主循环起点 ----
+    # 如果checkpoint显示该平台在上次运行中已经跑完（start_round >=
+    # total_rounds，例如"twitter跑完了、reddit还没跑完"就被杀死的场景），
+    # range()会自然产生一个空区间，循环体一次都不会执行，无需额外分支。
+    start_round = resume_state["start_round"] if resume else 0
+    if resume and start_round >= total_rounds:
+        log_info(f"续跑模式: 该平台此前已完成全部 {total_rounds} 轮，无需继续")
+
     start_time = datetime.now()
-    
-    for round_num in range(total_rounds):
+    # LLM凭证热重载：见模块顶部"LLM 凭证热重载"一节
+    cred_reload_last_mtime: Optional[float] = None
+    cred_reload_last_version: int = 0
+
+    for round_num in range(start_round, total_rounds):
         # 检查是否收到退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
-        
+
+        # 检查Flask后端是否广播了新的LLM凭证，有则原地重建model内部的
+        # OpenAI客户端
+        cred_reload_last_mtime, cred_reload_last_version = (
+            _poll_and_apply_credentials_reload(
+                simulation_dir, model,
+                cred_reload_last_mtime, cred_reload_last_version,
+                platform="twitter",
+            )
+        )
+
         simulated_minutes = round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
-        
+
         active_agents = get_active_agents_for_round(
-            result.env, config, simulated_hour, round_num
+            result.env, config, simulated_hour, round_num,
+            simulation_id, "twitter",
         )
-        
+
         # 无论是否有活跃agent，都记录round开始
         if action_logger:
             action_logger.log_round_start(round_num + 1, simulated_hour)
-        
+
         if not active_agents:
             # 没有活跃agent时也记录round结束（actions_count=0）
             if action_logger:
                 action_logger.log_round_end(round_num + 1, 0)
+            await write_round_checkpoint(
+                simulation_dir, "twitter",
+                next_round_index=round_num + 1,
+                last_rowid=last_rowid,
+                total_actions=total_actions,
+                original_start_time=original_start_time,
+            )
             continue
-        
+
         actions = {agent: LLMAction() for _, agent in active_agents}
         await result.env.step(actions)
-        
+
         # 从数据库获取实际执行的动作并记录
         actual_actions, last_rowid = fetch_new_actions_from_db(
             db_path, last_rowid, agent_names
         )
-        
+
         round_action_count = 0
         for action_data in actual_actions:
             if action_logger:
@@ -1270,193 +1023,341 @@ async def run_twitter_simulation(
                 )
                 total_actions += 1
                 round_action_count += 1
-        
+
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
+        # checkpoint必须紧跟在log_round_end之后写入，把"这一轮的产出已经
+        # 完整落盘"和"续跑起点前移一格"这两件事绑定在一起。
+        await write_round_checkpoint(
+            simulation_dir, "twitter",
+            next_round_index=round_num + 1,
+            last_rowid=last_rowid,
+            total_actions=total_actions,
+            original_start_time=original_start_time,
+        )
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
 
 
 async def run_reddit_simulation(
-    config: Dict[str, Any], 
+    config: Dict[str, Any],
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    resume: bool = False,
 ) -> PlatformSimulation:
     """运行Reddit模拟
-    
+
     Args:
         config: 模拟配置
         simulation_dir: 模拟目录
         action_logger: 动作日志记录器
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
-        
+        resume: 是否从 round_checkpoint.json 记录的断点续跑。Reddit的
+            created_at 用的是 sandbox_clock.time_transfer(now, start_time)
+            ——真实经过的时间乘以60倍加到start_time上——而 oasis.make()
+            在传入 DefaultPlatformType.REDDIT 时只会创建一个全新的
+            Platform（sandbox_clock=None -> 新Clock(60), start_time=None
+            -> 进程重启那一刻的datetime.now()）。如果续跑时对Reddit也走
+            这条默认路径，新Platform的start_time会被重置成"续跑这一刻"的
+            墙钟时间，而不是原模拟的时间线延续，制造出一次相对原时间线
+            的巨大跳变。修复方式：自己构造一个 Platform 实例（和
+            OasisEnv内部REDDIT分支用完全相同的参数），把 start_time 回拨
+            到"原始start_time + 已完成轮数隐含的模拟分钟数"，再把这个
+            Platform实例（而不是DefaultPlatformType.REDDIT）传给
+            oasis.make()——OasisEnv.__init__ 的
+            isinstance(platform, Platform) 分支会正确地把 channel 和
+            recsys_type 都从这个Platform实例上转发过去。
+
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
     result = PlatformSimulation()
-    
+
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Reddit] {msg}")
         print(f"[Reddit] {msg}")
-    
+
     log_info("初始化...")
-    
+
+    simulation_id = config.get("simulation_id", "unknown")
+
+    db_path = os.path.join(simulation_dir, "reddit_simulation.db")
+
+    # 提前算出 minutes_per_round，供下面回拨 Reddit 时钟的 start_time 使用
+    time_config = config.get("time_config", {})
+    total_hours = time_config.get("total_simulation_hours", 72)
+    minutes_per_round = time_config.get("minutes_per_round", 30)
+    total_rounds = (total_hours * 60) // minutes_per_round
+    if max_rounds is not None and max_rounds > 0:
+        original_rounds = total_rounds
+        total_rounds = min(total_rounds, max_rounds)
+        if total_rounds < original_rounds:
+            log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+
+    # ---- Gated site 1: 续跑校验（必须在做任何昂贵的工作之前尽早失败）----
+    resume_state = {
+        "found": False, "start_round": 0, "last_rowid": 0, "total_actions": 0,
+        "original_start_time": None,
+    }
+    if resume:
+        resume_state = load_resume_state(simulation_dir, "reddit")
+        if not resume_state["found"]:
+            log_info(
+                "错误: 请求续跑(--resume)但未在 round_checkpoint.json 中找到 "
+                "reddit 平台的记录，拒绝继续（避免跳过初始事件播种或在空"
+                "数据库上运行）。请改用强制重新开始。"
+            )
+            return result
+        if not _db_schema_is_complete(db_path):
+            log_info(
+                f"错误: 数据库表结构不完整，拒绝在此基础上续跑: {db_path}"
+            )
+            return result
+        log_info(
+            f"续跑模式: 从 round {resume_state['start_round']} 开始，"
+            f"last_rowid={resume_state['last_rowid']}, "
+            f"已记录动作数={resume_state['total_actions']}"
+        )
+
     # Reddit 使用加速 LLM 配置（如果有的话，否则回退到通用配置）
     model = create_model(config, use_boost=True)
-    
+
     profile_path = os.path.join(simulation_dir, "reddit_profiles.json")
     if not os.path.exists(profile_path):
         log_info(f"错误: Profile文件不存在: {profile_path}")
         return result
-    
+
     result.agent_graph = await generate_reddit_agent_graph(
         profile_path=profile_path,
         model=model,
         available_actions=REDDIT_ACTIONS,
     )
-    
+
     # 从配置文件获取 Agent 真实名称映射（使用 entity_name 而非默认的 Agent_X）
     agent_names = get_agent_names_from_config(config)
     # 如果配置中没有某个 agent，则使用 OASIS 的默认名称
     for agent_id, agent in result.agent_graph.get_agents():
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
-    
-    db_path = os.path.join(simulation_dir, "reddit_simulation.db")
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    
+
+    # ---- Gated site 2: 数据库删除（resume时必须保留，否则等于从头开始）----
+    if not resume:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        await clear_checkpoint_platform_section(simulation_dir, "reddit")
+
+    # Reddit 时钟连续性修复（见函数docstring）：始终自己构造 Platform，
+    # 而不是让 oasis.make() 用 DefaultPlatformType.REDDIT 隐式创建一个
+    # start_time=进程启动时刻的新Platform。这样无论是否resume，
+    # start_time 都是一个我们自己知道、可以持久化进checkpoint的值。
+    if resume and resume_state["original_start_time"] is not None:
+        original_start_time = resume_state["original_start_time"]
+    else:
+        original_start_time = datetime.now()
+
+    if resume:
+        # 把 start_time 按"已完成轮数隐含的模拟分钟数"向前推，而不是简单
+        # 复用 original_start_time 本身——否则新产生的帖子created_at会
+        # 直接跳回模拟刚开始的时间点，倒退回去而不是接续下去。用
+        # round_num（而不是恢复前的真实耗时）作为推进依据是刻意的：这样
+        # 无论续跑多少次，同一个start_round总是映射到同一个platform_start_
+        # time，不会因为"这次恢复走了多久"而漂移。
+        platform_start_time = original_start_time + timedelta(
+            minutes=resume_state["start_round"] * minutes_per_round
+        )
+        log_info(
+            f"Reddit 时钟连续性: original_start_time={original_start_time.isoformat()}, "
+            f"回拨后 start_time={platform_start_time.isoformat()} "
+            f"(start_round={resume_state['start_round']} x "
+            f"{minutes_per_round}分钟/轮)"
+        )
+    else:
+        platform_start_time = original_start_time
+
+    reddit_channel = Channel()
+    reddit_platform = Platform(
+        db_path=db_path,
+        channel=reddit_channel,
+        sandbox_clock=Clock(60),
+        start_time=platform_start_time,
+        recsys_type="reddit",
+        allow_self_rating=True,
+        show_score=True,
+        max_rec_post_len=100,
+        refresh_rec_post_count=5,
+    )
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
-        platform=oasis.DefaultPlatformType.REDDIT,
+        platform=reddit_platform,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
+
+    # env.reset() 保持无条件执行：它重启 platform.running() 消息循环，并
+    # 重新signup所有agent——针对一个保留下来的数据库重跑sign_up是安全
+    # 的，oasis Platform.sign_up 把 INSERT INTO user 包在
+    # try/except Exception 里，失败(主键冲突)只会返回
+    # {"success": False}，绝不抛异常，也不会在 sign_up 失败时写入重复的
+    # SIGNUP trace行（_record_trace 在返回之后才会执行）。
     await result.env.reset()
     log_info("环境已启动")
-    
+
     if action_logger:
         action_logger.log_simulation_start(config)
-    
-    total_actions = 0
-    last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
-    event_config = config.get("event_config", {})
-    initial_posts = event_config.get("initial_posts", [])
-    
-    # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
-    initial_action_count = 0
-    if initial_posts:
-        initial_actions = {}
-        for post in initial_posts:
-            agent_id = post.get("poster_agent_id", 0)
-            content = post.get("content", "")
-            try:
-                agent = result.env.agent_graph.get_agent(agent_id)
-                if agent in initial_actions:
-                    if not isinstance(initial_actions[agent], list):
-                        initial_actions[agent] = [initial_actions[agent]]
-                    initial_actions[agent].append(ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    ))
-                else:
-                    initial_actions[agent] = ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    )
-                
-                if action_logger:
-                    action_logger.log_action(
-                        round_num=0,
-                        agent_id=agent_id,
-                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
-                        action_type="CREATE_POST",
-                        action_args={"content": content}
-                    )
-                    total_actions += 1
-                    initial_action_count += 1
-            except Exception:
-                pass
-        
-        if initial_actions:
-            await result.env.step(initial_actions)
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
-    # 记录 round 0 结束
-    if action_logger:
-        action_logger.log_round_end(0, initial_action_count)
-    
-    # 主模拟循环
-    time_config = config.get("time_config", {})
-    total_hours = time_config.get("total_simulation_hours", 72)
-    minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
-    
-    # 如果指定了最大轮数，则截断
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
+
+    total_actions = resume_state["total_actions"] if resume else 0
+    # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）。
+    # resume时必须从checkpoint恢复——这是整个续跑机制里最重要的一步：
+    # 不恢复的话 fetch_new_actions_from_db 会把保留数据库里全部历史trace
+    # 行都当成"新动作"重新写入actions.jsonl，污染UI动作流和图谱摄取源。
+    last_rowid = resume_state["last_rowid"] if resume else 0
+
+    # ---- Gated site 3: 初始事件播种（resume时必须跳过，否则重复发帖）----
+    if not resume:
+        event_config = config.get("event_config", {})
+        initial_posts = event_config.get("initial_posts", [])
+
+        # 记录 round 0 开始（初始事件阶段）
+        if action_logger:
+            action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+
+        initial_action_count = 0
+        if initial_posts:
+            initial_actions = {}
+            for post in initial_posts:
+                agent_id = post.get("poster_agent_id", 0)
+                content = post.get("content", "")
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
+                    if agent in initial_actions:
+                        if not isinstance(initial_actions[agent], list):
+                            initial_actions[agent] = [initial_actions[agent]]
+                        initial_actions[agent].append(ManualAction(
+                            action_type=ActionType.CREATE_POST,
+                            action_args={"content": content}
+                        ))
+                    else:
+                        initial_actions[agent] = ManualAction(
+                            action_type=ActionType.CREATE_POST,
+                            action_args={"content": content}
+                        )
+
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=0,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="CREATE_POST",
+                            action_args={"content": content}
+                        )
+                        total_actions += 1
+                        initial_action_count += 1
+                except Exception:
+                    pass
+
+            if initial_actions:
+                await result.env.step(initial_actions)
+                log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+
+        # 记录 round 0 结束
+        if action_logger:
+            action_logger.log_round_end(0, initial_action_count)
+
+        # round 0（初始事件轮）跑完，落一次checkpoint：如果接下来主循环
+        # 还没开始就被杀死，续跑时知道初始事件已经做过，不需要重新播种。
+        await write_round_checkpoint(
+            simulation_dir, "reddit",
+            next_round_index=0,
+            last_rowid=last_rowid,
+            total_actions=total_actions,
+            original_start_time=original_start_time,
+        )
+    else:
+        log_info("续跑模式: 跳过初始事件播种（round 0 已在上次运行中完成）")
+
+    # ---- Gated site 4: 主循环起点 ----
+    # 如果checkpoint显示该平台在上次运行中已经跑完（start_round >=
+    # total_rounds，例如"twitter跑完了、reddit还没跑完"就被杀死的场景），
+    # range()会自然产生一个空区间，循环体一次都不会执行，无需额外分支。
+    start_round = resume_state["start_round"] if resume else 0
+    if resume and start_round >= total_rounds:
+        log_info(f"续跑模式: 该平台此前已完成全部 {total_rounds} 轮，无需继续")
+
     start_time = datetime.now()
-    
-    for round_num in range(total_rounds):
+    # LLM凭证热重载：见模块顶部"LLM 凭证热重载"一节
+    cred_reload_last_mtime: Optional[float] = None
+    cred_reload_last_version: int = 0
+
+    for round_num in range(start_round, total_rounds):
         # 检查是否收到退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
-        
+
+        # 检查Flask后端是否广播了新的LLM凭证，有则原地重建model内部的
+        # OpenAI客户端
+        cred_reload_last_mtime, cred_reload_last_version = (
+            _poll_and_apply_credentials_reload(
+                simulation_dir, model,
+                cred_reload_last_mtime, cred_reload_last_version,
+                platform="reddit",
+            )
+        )
+
         simulated_minutes = round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
-        
+
         active_agents = get_active_agents_for_round(
-            result.env, config, simulated_hour, round_num
+            result.env, config, simulated_hour, round_num,
+            simulation_id, "reddit",
         )
-        
+
         # 无论是否有活跃agent，都记录round开始
         if action_logger:
             action_logger.log_round_start(round_num + 1, simulated_hour)
-        
+
         if not active_agents:
             # 没有活跃agent时也记录round结束（actions_count=0）
             if action_logger:
                 action_logger.log_round_end(round_num + 1, 0)
+            await write_round_checkpoint(
+                simulation_dir, "reddit",
+                next_round_index=round_num + 1,
+                last_rowid=last_rowid,
+                total_actions=total_actions,
+                original_start_time=original_start_time,
+            )
             continue
-        
+
         actions = {agent: LLMAction() for _, agent in active_agents}
         await result.env.step(actions)
-        
+
         # 从数据库获取实际执行的动作并记录
         actual_actions, last_rowid = fetch_new_actions_from_db(
             db_path, last_rowid, agent_names
         )
-        
+
         round_action_count = 0
         for action_data in actual_actions:
             if action_logger:
@@ -1469,23 +1370,33 @@ async def run_reddit_simulation(
                 )
                 total_actions += 1
                 round_action_count += 1
-        
+
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
+        # checkpoint必须紧跟在log_round_end之后写入，把"这一轮的产出已经
+        # 完整落盘"和"续跑起点前移一格"这两件事绑定在一起。
+        await write_round_checkpoint(
+            simulation_dir, "reddit",
+            next_round_index=round_num + 1,
+            last_rowid=last_rowid,
+            total_actions=total_actions,
+            original_start_time=original_start_time,
+        )
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
 
 
@@ -1519,7 +1430,18 @@ async def main():
         default=False,
         help='模拟完成后立即关闭环境，不进入等待命令模式'
     )
-    
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        default=False,
+        help=(
+            '从 round_checkpoint.json 记录的断点续跑：跳过数据库删除和'
+            '初始事件播种，从上次记录的round继续。要求该模拟目录下已经'
+            '存在有效的 round_checkpoint.json（由此前一次运行写入），'
+            '否则会拒绝启动而不是悄悄从round 0重跑。'
+        )
+    )
+
     args = parser.parse_args()
     
     # 在 main 函数开始时创建 shutdown 事件，确保整个程序都能响应退出信号
@@ -1547,6 +1469,7 @@ async def main():
     log_manager.info(f"配置文件: {args.config}")
     log_manager.info(f"模拟ID: {config.get('simulation_id', 'unknown')}")
     log_manager.info(f"等待命令模式: {'启用' if wait_for_commands else '禁用'}")
+    log_manager.info(f"续跑模式: {'启用（--resume）' if args.resume else '禁用（全新运行）'}")
     log_manager.info("=" * 60)
     
     time_config = config.get("time_config", {})
@@ -1577,14 +1500,15 @@ async def main():
     reddit_result: Optional[PlatformSimulation] = None
     
     if args.twitter_only:
-        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds)
+        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, resume=args.resume)
     elif args.reddit_only:
-        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds)
+        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds, resume=args.resume)
     else:
-        # 并行运行（每个平台使用独立的日志记录器）
+        # 并行运行（每个平台使用独立的日志记录器）。两个协程共享同一个
+        # round_checkpoint.json，写入侧已经用 _checkpoint_lock 序列化。
         results = await asyncio.gather(
-            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds),
-            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds),
+            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, resume=args.resume),
+            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds, resume=args.resume),
         )
         twitter_result, reddit_result = results
     

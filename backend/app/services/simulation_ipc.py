@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
+from ..utils.atomic_io import atomic_write_json, read_json_tolerant
 from ..utils.logger import get_logger
 
 logger = get_logger('mirofish.simulation_ipc')
@@ -90,6 +91,97 @@ class IPCResponse:
             error=data.get("error"),
             timestamp=data.get("timestamp", datetime.now().isoformat())
         )
+
+
+# ============================================================
+# LLM 凭证热重载广播（credentials_reload.json）
+# ============================================================
+#
+# 背景：一个已经在跑的模拟子进程在启动时通过 `_create_model()`/
+# `create_model()` 一次性读取 LLM_API_KEY/LLM_BASE_URL 并构造出 camel-ai
+# 的 OpenAIModel——凭证在构造时就被烤进了内部的 OpenAI/AsyncOpenAI 客户端
+# 对象。当用户在设置界面通过 `settings_store.apply_and_propagate` 热替换
+# Flask 进程的凭证时，仅仅更新 `Config`/`os.environ` 对这个已经在跑的子
+# 进程没有任何影响——它需要一种方式在运行期间得知"凭证变了"，并原地重建
+# 自己的 model 对象。
+#
+# 为什么不能复用上面的 ipc_commands/ 命令机制：那一套是单消费者、读完
+# 即删（delete-on-read，见 `SimulationIPCServer.poll_commands`/
+# `send_response`）。并行模式下 twitter 和 reddit 是两个独立的协程，各自
+# 独立轮询；如果凭证更新也走 ipc_commands/，两个协程里先轮到的那个会把
+# 命令文件删掉，另一个协程就永远收不到这次更新，静默地继续用旧（可能已
+# 欠费）的凭证跑下去。凭证更新因此改用一份独立的、只增不改语义的"广播"
+# 文件：所有消费者都可以各自独立、重复地读取同一份文件，谁都不会把它
+# "消费掉"。
+#
+# 使用方式：
+#   - Flask 侧（`settings_store.apply_and_propagate`）在凭证变化时调用
+#     `write_credentials_reload_broadcast()`，version 严格递增，文件
+#     永远不会被删除。
+#   - 模拟子进程侧（run_twitter_simulation.py/run_reddit_simulation.py/
+#     run_parallel_simulation.py）在各自的round循环里，用一份轻量的
+#     mtime检查外加自己独立维护的"上次应用到的version"来决定要不要
+#     重建model——三份脚本各自维护一份等价实现（这几个脚本本身就是彼此
+#     独立的裸入口，出于同样原因，round_checkpoint.json的读写逻辑在那三
+#     个脚本里也是各自拷贝的一份，而不是从这里import，见各脚本模块顶部
+#     "不复用 backend/app/utils/atomic_io.py 的原因"一节的说明：那样会把
+#     整个 Flask app 包带进子进程的import graph）。这里只保留 Flask 侧
+#     用得到的写入函数。
+
+CREDENTIALS_RELOAD_FILENAME = "credentials_reload.json"
+
+
+def write_credentials_reload_broadcast(
+    simulation_dir: str,
+    *,
+    llm_api_key: Optional[str],
+    llm_base_url: Optional[str],
+    llm_model_name: Optional[str] = None,
+) -> int:
+    """原子地把 <simulation_dir>/credentials_reload.json 的 version 加一，
+    并写入当前生效的 LLM 凭证字段。
+
+    这是一份"广播"而不是一条"命令"：从不删除，也从不要求消费者确认。
+    version 严格递增（读取旧文件里的 version 再加一；旧文件不存在/损坏则
+    从 1 开始），consumer 只需要记住自己上次应用过的 version、拿新读到的
+    version 跟它比较即可，不需要跟任何其它进程协调。
+
+    Args:
+        simulation_dir: 模拟数据目录（<uploads/simulations>/<simulation_id>）。
+        llm_api_key: 当前生效的 LLM_API_KEY（Config.LLM_API_KEY，已经完成
+            override/env/default 分层之后的最终值）。
+        llm_base_url: 当前生效的 LLM_BASE_URL，可以是 None（表示走 OpenAI
+            默认endpoint）。
+        llm_model_name: 当前生效的 LLM_MODEL_NAME，仅作记录/日志用途——
+            子进程的相机（camel-ai）model对象一旦构造完成就不会再重新绑定
+            model_type，这里不会、也不能让正在运行的模拟切换到一个不同的
+            模型类型。
+
+    Returns:
+        写入后的新 version（整数）。
+    """
+
+    os.makedirs(simulation_dir, exist_ok=True)
+    path = os.path.join(simulation_dir, CREDENTIALS_RELOAD_FILENAME)
+
+    existing = read_json_tolerant(path, default=None)
+    previous_version = existing.get("version") if isinstance(existing, dict) else None
+    new_version = (previous_version + 1) if isinstance(previous_version, int) else 1
+
+    document = {
+        "version": new_version,
+        "updated_at": datetime.now().isoformat(),
+        "llm_api_key": llm_api_key,
+        "llm_base_url": llm_base_url,
+        "llm_model_name": llm_model_name,
+    }
+    atomic_write_json(path, document, mode=0o600)
+
+    logger.info(
+        "已广播LLM凭证热重载: simulation_dir=%s, version=%s",
+        simulation_dir, new_version,
+    )
+    return new_version
 
 
 class SimulationIPCClient:
