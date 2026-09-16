@@ -21,6 +21,7 @@
       </div>
 
       <div class="header-right">
+        <SettingsModal />
         <LanguageSwitcher />
         <div class="step-divider"></div>
         <div class="workflow-step">
@@ -73,6 +74,7 @@ import { getProject, getGraphData } from '../api/graph'
 import { getSimulation } from '../api/simulation'
 import { getReport } from '../api/report'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
+import SettingsModal from '../components/SettingsModal.vue'
 
 const route = useRoute()
 const router = useRouter()

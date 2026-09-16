@@ -91,7 +91,10 @@
       </div>
 
       <div class="action-controls">
-        <button 
+        <span v-if="reportCaveatActive && phase === 2" class="report-caveat-hint" :title="t('log.reportPartialDataCaveatHint')">
+          ⚠ {{ t('log.reportPartialDataCaveatHint') }}
+        </span>
+        <button
           class="action-btn primary"
           :disabled="phase !== 2 || isGeneratingReport"
           @click="handleNextStep"
@@ -99,6 +102,32 @@
           <span v-if="isGeneratingReport" class="loading-spinner-small"></span>
           {{ isGeneratingReport ? $t('step3.generatingReportBtn') : $t('step3.startGenerateReportBtn') }}
           <span v-if="!isGeneratingReport" class="arrow-icon">→</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Non-blocking recovery banners: stall + pending graph ingestion.
+         Both read straight off the run-status poll, so they appear and
+         clear on their own as the underlying condition changes. -->
+    <div class="recovery-banners" v-if="showStallBanner || showIngestionBanner">
+      <div v-if="showStallBanner" class="recovery-banner stall-banner">
+        <span class="banner-icon">⏱</span>
+        <div class="banner-text">
+          <strong>{{ t('log.stallBannerTitle', { minutes: stallMinutes }) }}</strong>
+          <span>{{ t('log.stallBannerBody') }}</span>
+        </div>
+        <button class="banner-action" @click="handleOpenSettings">{{ t('log.openSettings') }}</button>
+      </div>
+
+      <div v-if="showIngestionBanner" class="recovery-banner ingestion-banner">
+        <span class="banner-icon">⧗</span>
+        <div class="banner-text">
+          <strong>{{ t('log.ingestionPendingBannerTitle', { count: pendingIngestionCount }) }}</strong>
+          <span>{{ t('log.ingestionPendingBannerBody') }}</span>
+        </div>
+        <button class="banner-action banner-action-ghost" @click="handleOpenSettings">{{ t('log.openSettings') }}</button>
+        <button class="banner-action" :disabled="isRetryingIngestion" @click="handleRetryIngestion">
+          {{ isRetryingIngestion ? t('log.retryingIngestion') : t('log.retryIngestion') }}
         </button>
       </div>
     </div>
@@ -282,6 +311,76 @@
         </div>
       </div>
     </div>
+
+    <!-- Resume-vs-restart confirmation, shown when this component mounts
+         and a run for this simulation already exists on the backend. -->
+    <Transition name="modal">
+      <div v-if="showResumeDialog" class="profile-modal-overlay resume-dialog-overlay">
+        <div class="profile-modal resume-dialog">
+          <div class="modal-header">
+            <div class="modal-header-info">
+              <span class="modal-realname">{{ t('log.existingRunFoundTitle') }}</span>
+            </div>
+          </div>
+          <div class="modal-body resume-dialog-body">
+            <p>{{ resumeDialogSummary }}</p>
+            <p v-if="dialogIngestionPending > 0" class="resume-dialog-subnote">
+              {{ t('log.resumeDialogIngestionNote', { count: dialogIngestionPending }) }}
+            </p>
+            <p v-if="dialogStallDetected" class="resume-dialog-subnote">
+              {{ t('log.resumeDialogStallNote') }}
+            </p>
+
+            <!-- Step 1: the three-way choice. Reattach and Continue are both
+                 non-destructive and styled identically as "safe"; Abandon is
+                 visually separated below a divider and styled as a warning,
+                 never a plain button alongside the other two. -->
+            <div class="resume-options" v-if="!abandonConfirmStep">
+              <button class="resume-option resume-option-safe" @click="handleResumeExisting">
+                <span class="option-title">{{ t('log.reattachExistingRun') }}</span>
+                <span class="option-desc">{{ t('log.reattachExistingRunDesc') }}</span>
+              </button>
+
+              <button v-if="resumeAvailable" class="resume-option resume-option-safe" @click="handleContinueFromCheckpoint">
+                <span class="option-title">{{ t('log.continueFromRound', { round: resumeFromRound }) }}</span>
+                <span class="option-desc">{{ t('log.continueFromRoundDesc', { round: resumeFromRound }) }}</span>
+              </button>
+
+              <div class="resume-options-divider"></div>
+
+              <button class="resume-option resume-option-danger" @click="handleAbandonAndRestart">
+                <span class="option-title">⚠ {{ t('log.abandonAndRestart') }}</span>
+                <span class="option-desc">{{ t('log.abandonAndRestartDesc', {
+                  twitterActs: pendingRunData?.twitter_actions_count || 0,
+                  redditActs: pendingRunData?.reddit_actions_count || 0,
+                  round: pendingRunData?.current_round || 0
+                }) }}</span>
+              </button>
+            </div>
+
+            <!-- Step 2: explicit confirmation naming exactly what gets
+                 erased. This is the only path that can actually destroy the
+                 run's progress. -->
+            <div class="abandon-confirm-panel" v-else>
+              <p class="abandon-confirm-title">⚠ {{ t('log.abandonConfirmTitle') }}</p>
+              <p class="abandon-confirm-body">{{ t('log.abandonConfirmBody', {
+                twitterActs: pendingRunData?.twitter_actions_count || 0,
+                redditActs: pendingRunData?.reddit_actions_count || 0,
+                round: pendingRunData?.current_round || 0
+              }) }}</p>
+              <div class="resume-dialog-actions">
+                <button class="resume-btn resume-btn-ghost" @click="cancelAbandonConfirm">
+                  {{ t('log.abandonConfirmCancel') }}
+                </button>
+                <button class="resume-btn resume-btn-danger-solid" @click="confirmAbandonAndRestart">
+                  {{ t('log.abandonConfirmYes') }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -293,9 +392,12 @@ import {
   startSimulation,
   stopSimulation,
   getRunStatus,
-  getRunStatusDetail
+  getRunStatusDetail,
+  resumeSimulation,
+  retryGraphIngestion
 } from '../api/simulation'
 import { generateReport } from '../api/report'
+import { requestOpenSettings } from '../store/settingsPanel'
 
 const { t } = useI18n()
 
@@ -325,6 +427,8 @@ const runStatus = ref({})
 const allActions = ref([]) // 所有动作（增量累积）
 const actionIds = ref(new Set()) // 用于去重的动作ID集合
 const scrollContainer = ref(null)
+const isContinuing = ref(false) // 是否正在从round断点续跑
+const isRetryingIngestion = ref(false) // 是否正在重试图谱写入
 
 // Computed
 // 按时间顺序显示动作（最新的在最后面，即底部）
@@ -339,6 +443,31 @@ const twitterActionsCount = computed(() => {
 
 const redditActionsCount = computed(() => {
   return allActions.value.filter(a => a.platform === 'reddit').length
+})
+
+// --- Recovery affordances (surfaced by GET .../run-status) ---
+
+// 图谱写入待确认数量：仅在没有平台仍在运行时展示重试入口——updater存活时
+// 后端 retry-ingestion 接口会直接返回409，此时展示按钮只会造成困惑。
+const pendingIngestionCount = computed(() => runStatus.value.graph_ingestion_pending || 0)
+const showIngestionBanner = computed(() => {
+  return pendingIngestionCount.value > 0 && !runStatus.value.twitter_running && !runStatus.value.reddit_running
+})
+
+// 停滞检测：后端只在runner_status===RUNNING时才可能返回true，因此这里无需
+// 额外按phase过滤——一旦轮询停止（进入终态），stall_detected自然不再为true。
+const showStallBanner = computed(() => !!runStatus.value.stall_detected)
+const stallMinutes = computed(() => {
+  const since = runStatus.value.stalled_since
+  if (!since) return 0
+  const elapsedMs = Date.now() - new Date(since).getTime()
+  return Math.max(0, Math.round(elapsedMs / 60000))
+})
+
+// 报告caveat：运行失败，或图谱记忆写入未被确认完整完成时，提醒用户报告
+// 可能基于不完整的数据——但不阻塞“生成报告”操作本身。
+const reportCaveatActive = computed(() => {
+  return runStatus.value.runner_status === 'failed' || runStatus.value.graph_ingestion_complete === false
 })
 
 // 格式化模拟流逝时间（根据轮次和每轮分钟数计算）
@@ -379,6 +508,30 @@ const resetAllState = () => {
   stopPolling()  // 停止之前可能存在的轮询
 }
 
+// A force-restart of a simulation that just failed/is finishing can hit a
+// backend 409 with `pending: true` -- the previous run's graph-memory
+// updater is still draining its last activity batches (this can take tens
+// of seconds against a local LLM+Neo4j pipeline) and the backend correctly
+// refuses to restart mid-drain rather than risk corrupting it. That's a
+// transient "not yet", not a real failure, so retry a few times with a
+// short delay instead of surfacing it as a generic error immediately.
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const startSimulationWithPendingRetry = async (params, maxAttempts = 6, delayMs = 5000) => {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await startSimulation(params)
+    } catch (err) {
+      const pending = err.response?.data?.pending === true
+      if (!pending || attempt === maxAttempts) {
+        throw err
+      }
+      addLog(t('log.previousRunStillFinalizing', { attempt, maxAttempts }))
+      await sleep(delayMs)
+    }
+  }
+}
+
 // 启动模拟
 const doStartSimulation = async () => {
   if (!props.simulationId) {
@@ -408,9 +561,9 @@ const doStartSimulation = async () => {
     }
     
     addLog(t('log.graphMemoryUpdateEnabled'))
-    
-    const res = await startSimulation(params)
-    
+
+    const res = await startSimulationWithPendingRetry(params)
+
     if (res.success && res.data) {
       if (res.data.force_restarted) {
         addLog(t('log.oldSimCleared'))
@@ -459,6 +612,42 @@ const handleStopSimulation = async () => {
     addLog(t('log.stopException', { error: err.message }))
   } finally {
     isStopping.value = false
+  }
+}
+
+// 打开设置面板（停滞/图谱写入卡住时，多半是LLM凭据的问题）
+const handleOpenSettings = () => {
+  requestOpenSettings()
+}
+
+// 重试图谱写入：完成一次被中断的图谱drain。不需要模拟子进程仍在运行——
+// 所有需要的数据都在 actions.jsonl 与 graph_ingestion journal 中，因此这里
+// 不依赖 phase/runStatus 是否处于某个特定状态，只依赖 simulationId。
+const handleRetryIngestion = async () => {
+  if (!props.simulationId || isRetryingIngestion.value) return
+
+  isRetryingIngestion.value = true
+  addLog(t('log.retryingIngestion'))
+
+  try {
+    const res = await retryGraphIngestion(props.simulationId)
+    if (res.success && res.data) {
+      const d = res.data
+      addLog(t('log.retryIngestionResult', {
+        resent: d.resent ?? 0,
+        already_committed: d.already_committed ?? 0,
+        still_failed: d.still_failed ?? 0
+      }))
+    } else {
+      addLog(t('log.retryIngestionFailed', { error: res.error || t('common.unknownError') }))
+    }
+  } catch (err) {
+    addLog(t('log.retryIngestionFailed', { error: err.message }))
+  } finally {
+    isRetryingIngestion.value = false
+    // 无论成功与否都刷新一次run-status，让pending计数/stall等字段反映
+    // 磁盘上的最新状态，而不是重试前的旧快照。
+    await fetchRunStatus()
   }
 }
 
@@ -516,7 +705,7 @@ const fetchRunStatus = async () => {
       const isFailed = data.runner_status === 'failed'
       
       // runner_status is authoritative because the backend only publishes a
-      // terminal state after the Zep ingestion barrier has completed.
+      // terminal state after the graph ingestion barrier has completed.
       if (isFailed) {
         addLog(t('log.simFailed') + (data.error ? `: ${data.error}` : ''))
         phase.value = 2
@@ -664,8 +853,16 @@ const handleNextStep = async () => {
     
     if (res.success && res.data) {
       const reportId = res.data.report_id
+      // graph_possibly_incomplete来自后端 _build_report_coverage 的实时判断
+      // （运行失败，或图谱记忆写入未被确认完整完成），而不是前端猜测——
+      // 据此提醒用户，但不阻止报告已经开始生成。
+      if (res.data.graph_possibly_incomplete) {
+        addLog(t('log.reportPartialDataCaveat', {
+          status: res.data.coverage?.runner_status || runStatus.value.runner_status || '?'
+        }))
+      }
       addLog(t('log.reportGenTaskStarted', { reportId }))
-      
+
       // 跳转到报告页面
       router.push({ name: 'Report', params: { reportId } })
     } else {
@@ -688,11 +885,190 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
-onMounted(() => {
-  addLog(t('log.step3Init'))
-  if (props.simulationId) {
-    doStartSimulation()
+// Detect an already-existing run on mount instead of blindly restarting it.
+// `doStartSimulation()` force-restarts the backend simulation (wiping its
+// round/action history) -- calling it unconditionally on every mount meant
+// every page refresh, or even just navigating back to this step, silently
+// threw away an in-progress (or already-completed) run and started a brand
+// new one from round 0, with no way to say "no, keep the one that's running".
+// Conversely, always silently resuming would remove the only way a user has
+// to intentionally restart (there is no separate "Restart" button elsewhere
+// in this wizard -- mounting this step *is* the start action). So: when a
+// run already exists, ask, rather than guessing either way.
+const showResumeDialog = ref(false)
+const pendingRunData = ref(null)
+// Two-step guard on the destructive option: clicking "Abandon & restart"
+// never destroys anything by itself -- it only reveals an explicit second
+// confirmation naming exactly what will be erased. A single mis-click can no
+// longer wipe a run (this UI previously cost the user a completed 72-round
+// run to exactly that mistake).
+const abandonConfirmStep = ref(false)
+
+const resumeDialogSummary = computed(() => {
+  const data = pendingRunData.value
+  if (!data) return ''
+  return t('log.existingRunSummary', {
+    status: data.runner_status,
+    round: data.current_round || 0,
+    total: data.total_rounds || props.maxRounds || '-',
+    twitterActs: data.twitter_actions_count || 0,
+    redditActs: data.reddit_actions_count || 0,
+  })
+})
+
+const isActiveRunnerStatus = (status) => ['starting', 'running', 'paused', 'stopping'].includes(status)
+
+// "Continue from round N" is only meaningful -- and only accepted by the
+// backend -- when a round checkpoint exists AND nothing is currently active
+// for this simulation (resume_available reflects the checkpoint's presence,
+// but not whether a run is already live). A failed run that predates
+// checkpointing (resume_available: false) correctly never shows this.
+const resumeAvailable = computed(() => {
+  const data = pendingRunData.value
+  return !!data?.resume_available && !isActiveRunnerStatus(data?.runner_status)
+})
+const resumeFromRound = computed(() => pendingRunData.value?.resume_from_round)
+const dialogIngestionPending = computed(() => pendingRunData.value?.graph_ingestion_pending || 0)
+const dialogStallDetected = computed(() => !!pendingRunData.value?.stall_detected)
+
+const applyResumedStatus = (data) => {
+  const runnerStatus = data.runner_status
+  runStatus.value = data
+  prevTwitterRound.value = data.twitter_current_round || 0
+  prevRedditRound.value = data.reddit_current_round || 0
+
+  const isActive = ['starting', 'running', 'paused', 'stopping'].includes(runnerStatus)
+  if (isActive) {
+    phase.value = 1
+    startStatusPolling()
+    startDetailPolling()
+  } else if (runnerStatus === 'failed') {
+    phase.value = 2
+    addLog(t('log.simFailed') + (data.error ? `: ${data.error}` : ''))
+    emit('update-status', 'error')
+  } else {
+    // completed / stopped
+    phase.value = 2
+    emit('update-status', 'completed')
   }
+}
+
+const handleResumeExisting = async () => {
+  const data = pendingRunData.value
+  showResumeDialog.value = false
+  abandonConfirmStep.value = false
+  pendingRunData.value = null
+  if (!data) return
+  addLog(t('log.resumingExistingRun'))
+  applyResumedStatus(data)
+  // Backfill the action feed immediately rather than waiting for the next
+  // poll tick, so resuming doesn't look stuck even briefly.
+  await fetchRunStatusDetail()
+}
+
+// Restart the simulation subprocess from the on-disk round checkpoint. This
+// is the opposite of both other options: unlike "reattach" it actually
+// starts a new subprocess, and unlike "abandon" it keeps every round already
+// completed -- it calls POST /resume, which the backend rejects outright if
+// `force` were ever added here, precisely so this path can never turn into a
+// wipe-and-restart by accident.
+const handleContinueFromCheckpoint = async () => {
+  const data = pendingRunData.value
+  const round = data?.resume_from_round
+  showResumeDialog.value = false
+  abandonConfirmStep.value = false
+  pendingRunData.value = null
+  if (!props.simulationId) return
+
+  resetAllState()
+  isContinuing.value = true
+  addLog(t('log.continuingFromRound', { round }))
+  emit('update-status', 'processing')
+
+  try {
+    const params = {
+      simulation_id: props.simulationId,
+      platform: 'parallel',
+      enable_graph_memory_update: true
+    }
+    if (props.maxRounds) {
+      params.max_rounds = props.maxRounds
+    }
+
+    const res = await resumeSimulation(params)
+
+    if (res.success && res.data) {
+      addLog(t('log.continueSuccess', { round }))
+      phase.value = 1
+      runStatus.value = res.data
+      startStatusPolling()
+      startDetailPolling()
+      // Backfill the accumulated action feed (prior rounds included) right
+      // away instead of waiting for the next 3s detail-poll tick.
+      await fetchRunStatusDetail()
+    } else {
+      addLog(t('log.continueFailed', { error: res.error || t('common.unknownError') }))
+      emit('update-status', 'error')
+    }
+  } catch (err) {
+    addLog(t('log.continueFailed', { error: err.message }))
+    emit('update-status', 'error')
+  } finally {
+    isContinuing.value = false
+  }
+}
+
+// Step 1 of the destructive path: reveal the confirmation panel. Nothing is
+// deleted yet.
+const handleAbandonAndRestart = () => {
+  abandonConfirmStep.value = true
+}
+
+const cancelAbandonConfirm = () => {
+  abandonConfirmStep.value = false
+}
+
+// Step 2: the user has seen exactly what will be erased and confirmed it
+// explicitly. Only now does the destructive force-restart actually run.
+const confirmAbandonAndRestart = async () => {
+  showResumeDialog.value = false
+  abandonConfirmStep.value = false
+  pendingRunData.value = null
+  addLog(t('log.abandoningExistingRun'))
+  await doStartSimulation()
+}
+
+const resumeOrStartSimulation = async () => {
+  if (!props.simulationId) return
+
+  addLog(t('log.step3Init'))
+
+  try {
+    const res = await getRunStatus(props.simulationId)
+    const data = res.success ? res.data : null
+    const runnerStatus = data?.runner_status
+
+    if (!data || runnerStatus === 'idle') {
+      // Nothing running yet for this simulation -- nothing to abandon, this
+      // mount is the actual "start" action (e.g. navigating here for the
+      // first time from step 2). No need to prompt.
+      await doStartSimulation()
+      return
+    }
+
+    // A run already exists (starting/running/paused/stopping/completed/
+    // stopped/failed). Ask the user whether to reconnect to it or abandon
+    // it and start over, rather than deciding silently either way.
+    pendingRunData.value = data
+    showResumeDialog.value = true
+  } catch (err) {
+    console.warn('检查现有模拟状态失败，回退为启动新模拟:', err)
+    await doStartSimulation()
+  }
+}
+
+onMounted(() => {
+  resumeOrStartSimulation()
 })
 
 onUnmounted(() => {
@@ -872,6 +1248,15 @@ onUnmounted(() => {
   align-items: center;
 }
 
+.action-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
 /* Action Button */
 .action-btn {
   display: inline-flex;
@@ -891,6 +1276,8 @@ onUnmounted(() => {
 .action-btn.primary {
   background: #000;
   color: #FFF;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .action-btn.primary:hover:not(:disabled) {
@@ -1264,5 +1651,295 @@ onUnmounted(() => {
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
   margin-right: 6px;
+}
+
+/* Resume-vs-restart confirmation dialog */
+.profile-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.resume-dialog {
+  background: #FFF;
+  border-radius: 8px;
+  width: 540px;
+  max-width: 90vw;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+
+.resume-dialog .modal-header {
+  padding: 20px 24px 0;
+}
+
+.resume-dialog .modal-realname {
+  font-size: 16px;
+  font-weight: 700;
+  color: #111;
+}
+
+.resume-dialog-body {
+  padding: 16px 24px 24px;
+}
+
+.resume-dialog-body p {
+  margin: 0 0 20px;
+  color: #444;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.resume-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.resume-btn {
+  padding: 9px 18px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.resume-btn:hover {
+  opacity: 0.85;
+}
+
+.resume-btn-primary {
+  background: #111;
+  color: #FFF;
+}
+
+.resume-btn-danger {
+  background: #FFF;
+  color: #C0392B;
+  border-color: #C0392B;
+}
+
+.resume-btn-ghost {
+  background: #FFF;
+  color: #444;
+  border-color: #DDD;
+}
+
+.resume-btn-danger-solid {
+  background: #C0392B;
+  color: #FFF;
+}
+
+.resume-dialog-subnote {
+  margin: -10px 0 16px !important;
+  padding: 8px 12px;
+  background: #FAFAFA;
+  border: 1px dashed #DDD;
+  border-radius: 4px;
+  font-size: 12px !important;
+  color: #777 !important;
+  line-height: 1.5 !important;
+}
+
+/* --- Three-way recovery choice --- */
+.resume-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.resume-option {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: 6px;
+  border: 1.5px solid transparent;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+}
+
+.resume-option-safe {
+  background: #F7F7F7;
+  border-color: #E5E5E5;
+}
+
+.resume-option-safe:hover {
+  background: #111;
+  border-color: #111;
+}
+
+.resume-option-safe:hover .option-title,
+.resume-option-safe:hover .option-desc {
+  color: #FFF;
+}
+
+.resume-option .option-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #111;
+}
+
+.resume-option .option-desc {
+  font-size: 12px;
+  color: #777;
+  line-height: 1.5;
+}
+
+.resume-options-divider {
+  height: 1px;
+  background: #EEE;
+  margin: 4px 0;
+}
+
+/* The destructive option is intentionally the odd one out: outlined in red,
+   never adjacent-styled the same as the two safe options above. */
+.resume-option-danger {
+  background: #FFF;
+  border-color: #F0C4BC;
+}
+
+.resume-option-danger:hover {
+  background: #FDF2F0;
+  border-color: #C0392B;
+}
+
+.resume-option-danger .option-title {
+  color: #C0392B;
+}
+
+.resume-option-danger .option-desc {
+  color: #B0554A;
+}
+
+/* Step-2 explicit confirmation for the destructive path */
+.abandon-confirm-panel {
+  background: #FDF2F0;
+  border: 1.5px solid #C0392B;
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.abandon-confirm-title {
+  margin: 0 0 8px !important;
+  font-size: 15px !important;
+  font-weight: 700 !important;
+  color: #C0392B !important;
+}
+
+.abandon-confirm-body {
+  margin: 0 0 16px !important;
+  font-size: 13px !important;
+  color: #7A2D24 !important;
+  line-height: 1.6 !important;
+}
+
+/* --- Non-blocking recovery banners (stall / graph ingestion pending) --- */
+.recovery-banners {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.recovery-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 24px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.banner-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.banner-text strong {
+  font-size: 12px;
+}
+
+.banner-text span {
+  color: inherit;
+  opacity: 0.85;
+}
+
+.banner-action {
+  flex-shrink: 0;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+}
+
+.banner-action:hover:not(:disabled) {
+  opacity: 0.7;
+}
+
+.banner-action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.banner-action-ghost {
+  border-color: transparent;
+  text-decoration: underline;
+}
+
+/* Amber / informational -- explicitly NOT alarming. Stalled means "probably
+   wedged", not "dead", and the copy + color both need to say so. */
+.stall-banner {
+  background: #FFF8E1;
+  border-bottom: 1px solid #F0DFA0;
+  color: #8A6D1D;
+}
+
+.ingestion-banner {
+  background: #F5F7FF;
+  border-bottom: 1px solid #D6DEFF;
+  color: #33415C;
+}
+
+.report-caveat-hint {
+  font-size: 11px;
+  color: #B8860B;
+  line-height: 1.4;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.modal-enter-active, .modal-leave-active {
+  transition: opacity 0.2s ease;
+}
+
+.modal-enter-from, .modal-leave-to {
+  opacity: 0;
 }
 </style>

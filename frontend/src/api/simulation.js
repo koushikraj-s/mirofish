@@ -95,6 +95,22 @@ export const stopSimulation = (data) => {
 }
 
 /**
+ * 从上一次的round断点续跑模拟（真正的断点续跑，绝不清理已有运行产物）
+ * @param {Object} data - { simulation_id, platform?, max_rounds?, enable_graph_memory_update? }
+ */
+export const resumeSimulation = (data) => {
+  return service.post('/api/simulation/resume', data)
+}
+
+/**
+ * 重试/完成一次被中断的图谱写入（无需模拟子进程仍在运行）
+ * @param {string} simulationId
+ */
+export const retryGraphIngestion = (simulationId) => {
+  return service.post(`/api/simulation/${simulationId}/graph/retry-ingestion`)
+}
+
+/**
  * 获取模拟运行实时状态
  * @param {string} simulationId
  */
