@@ -71,11 +71,41 @@ class Config:
         errors: list[str] = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
-        if os.environ.get("ZEP_API_URL"):
-            errors.append("ZEP_API_URL 不受支持；MiroFish 仅连接 Zep Cloud")
+        if not cls.NEO4J_URI:
+            errors.append("NEO4J_URI 未配置")
         if cls.DEBUG:
             import warnings
             warnings.warn("Flask DEBUG mode is enabled. Do not use in production.", RuntimeWarning)
         return errors
+
+
+def _apply_persisted_credential_overrides() -> None:
+    """Layer any runtime-saved credential overrides on top of the `.env`/
+    class defaults set above, so the UI-editable settings
+    (`backend/uploads/config/credentials.json`, see
+    `services/settings_store.py`) survive a process restart.
+
+    This MUST run before `run.py`'s `Config.validate()`: a user who
+    configures everything via the settings UI and leaves `.env` empty
+    would otherwise fail `Config.validate()`'s `LLM_API_KEY`/`NEO4J_URI`
+    checks and the process would `sys.exit(1)` before ever applying their
+    saved override.
+
+    The import is deferred to inside this function (called at the very
+    bottom of this module, after the `Config` class body above has fully
+    executed) rather than placed at module scope, because
+    `services/settings_store.py` itself does `from ..config import
+    Config` -- an unconditional module-level import here would be a
+    circular import between `app.config` and `app.services.settings_store`
+    evaluated before `Config` exists to import. Deferring it until after
+    the class body means `app.config`'s module object already has `Config`
+    bound as an attribute by the time `settings_store` asks for it, even
+    though `app.config` itself hasn't finished executing yet.
+    """
+
+    from .services.settings_store import apply_to_config
+
+    apply_to_config()
+
+
+_apply_persisted_credential_overrides()
