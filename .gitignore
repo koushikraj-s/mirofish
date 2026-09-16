@@ -58,3 +58,8 @@ backend/uploads/
 
 # Docker 数据
 data/
+
+# 本地参考用的 Graphiti 源码克隆（仅供查阅其 API，不是本项目的一部分）
+# It is a full nested git clone (~38MB); committing it would add another
+# repository into this one as a broken nested-repo entry.
+graphiti-reference/

@@ -6,12 +6,16 @@
 import json
 import logging
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple, Type
+
+from pydantic import BaseModel, Field, create_model
+
 from ..utils.llm_client import LLMClient
 from ..utils.locale import get_language_instruction
 from ..utils.file_parser import split_text_into_chunks
 from ..utils.ontology import (
     MAX_ONTOLOGY_TYPES,
+    RESERVED_ONTOLOGY_ATTRIBUTE_NAMES,
     normalize_ontology_attributes,
     normalize_ontology_source_targets,
 )
@@ -244,9 +248,92 @@ class OntologyGenerator:
         
         # 验证和后处理
         result = self._validate_and_process(result)
-        
+
         return result
-    
+
+    @staticmethod
+    def _safe_attribute_name(attr_name: str) -> str:
+        """Rename an attribute that collides with a Graphiti/Pydantic reserved name."""
+
+        if attr_name.lower() in RESERVED_ONTOLOGY_ATTRIBUTE_NAMES:
+            return f"entity_{attr_name}"
+        return attr_name
+
+    @classmethod
+    def build_pydantic_types(
+        cls, ontology: Dict[str, Any]
+    ) -> Tuple[
+        Dict[str, Type[BaseModel]],
+        Dict[str, Type[BaseModel]],
+        Dict[Tuple[str, str], List[str]],
+    ]:
+        """
+        将本体定义（JSON）转换为 Graphiti 需要的运行时 Pydantic 类型。
+
+        Graphiti 的 `add_episode(entity_types=..., edge_types=..., edge_type_map=...)`
+        直接接收 `dict[str, type[BaseModel]]`，没有 Zep Cloud 那样单独的
+        "设置图谱本体" 步骤。本方法用 `pydantic.create_model` 动态构建这些类型，
+        供每次 `add_episode` 调用直接传入。
+
+        Returns:
+            (entity_types, edge_types, edge_type_map)
+            - entity_types: {类型名: Pydantic模型}
+            - edge_types: {类型名: Pydantic模型}
+            - edge_type_map: {(source_type, target_type): [edge_type_name, ...]}
+        """
+        entity_types: Dict[str, Type[BaseModel]] = {}
+        for entity_def in ontology.get("entity_types", [])[:MAX_ONTOLOGY_TYPES]:
+            name = entity_def["name"]
+            description = entity_def.get("description", f"A {name} entity.")
+
+            fields: Dict[str, Any] = {}
+            for normalized in normalize_ontology_attributes(
+                entity_def.get("attributes", [])
+            ):
+                attr_name = cls._safe_attribute_name(normalized["name"])
+                attr_desc = normalized["description"]
+                fields[attr_name] = (
+                    Optional[str],
+                    Field(default=None, description=attr_desc),
+                )
+
+            entity_model = create_model(name, __doc__=description, **fields)
+            entity_types[name] = entity_model
+
+        edge_types: Dict[str, Type[BaseModel]] = {}
+        edge_type_map: Dict[Tuple[str, str], List[str]] = {}
+        for edge_def in ontology.get("edge_types", [])[:MAX_ONTOLOGY_TYPES]:
+            name = edge_def["name"]
+            description = edge_def.get("description", f"A {name} relationship.")
+
+            fields = {}
+            for normalized in normalize_ontology_attributes(
+                edge_def.get("attributes", [])
+            ):
+                attr_name = cls._safe_attribute_name(normalized["name"])
+                attr_desc = normalized["description"]
+                fields[attr_name] = (
+                    Optional[str],
+                    Field(default=None, description=attr_desc),
+                )
+
+            edge_model = create_model(name, __doc__=description, **fields)
+
+            source_targets = normalize_ontology_source_targets(
+                edge_def.get("source_targets", [])
+            )
+            if not source_targets:
+                continue
+
+            edge_types[name] = edge_model
+            for st in source_targets:
+                key = (st.get("source", "Entity"), st.get("target", "Entity"))
+                edge_type_map.setdefault(key, [])
+                if name not in edge_type_map[key]:
+                    edge_type_map[key].append(name)
+
+        return entity_types, edge_types, edge_type_map
+
     # 传给 LLM 的文本最大长度（5万字）
     MAX_TEXT_LENGTH_FOR_LLM = 50000
     LONG_TEXT_CHUNK_SIZE = 8000
@@ -626,79 +713,86 @@ class OntologyGenerator:
     
     def generate_python_code(self, ontology: Dict[str, Any]) -> str:
         """
-        将本体定义转换为Python代码（类似ontology.py）
-        
+        将本体定义转换为Python代码（类似ontology.py），供人工检视/调试使用。
+
+        生成的类型与 `build_pydantic_types()` 在运行时动态构建的类型是同构的：
+        普通 `pydantic.BaseModel` 子类 + `EDGE_TYPE_MAP`（Graphiti
+        `add_episode(edge_type_map=...)` 期望的 `(source, target) -> [edge_name]`
+        形状），而不是 Zep Cloud 专有的 `EntityModel`/`EdgeModel`/`EntityText`。
+
         Args:
             ontology: 本体定义
-            
+
         Returns:
             Python代码字符串
         """
         code_lines = [
             '"""',
             '自定义实体类型定义',
-            '由MiroFish自动生成，用于社会舆论模拟',
+            '由MiroFish自动生成，用于社会舆论模拟（Graphiti add_episode 的',
+            'entity_types / edge_types / edge_type_map 参数）',
             '"""',
             '',
-            'from pydantic import Field',
-            'from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel',
+            'from typing import Optional',
+            '',
+            'from pydantic import BaseModel, Field',
             '',
             '',
             '# ============== 实体类型定义 ==============',
             '',
         ]
-        
+
         # 生成实体类型
         for entity in ontology.get("entity_types", []):
             name = entity["name"]
             desc = entity.get("description", f"A {name} entity.")
-            
-            code_lines.append(f'class {name}(EntityModel):')
+
+            code_lines.append(f'class {name}(BaseModel):')
             code_lines.append(f'    """{desc}"""')
-            
+
             attrs = entity.get("attributes", [])
             if attrs:
                 for attr in attrs:
                     attr_name = attr["name"]
                     attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
+                    code_lines.append(f'    {attr_name}: Optional[str] = Field(')
+                    code_lines.append(f'        default=None,')
                     code_lines.append(f'        description="{attr_desc}",')
-                    code_lines.append(f'        default=None')
                     code_lines.append(f'    )')
             else:
                 code_lines.append('    pass')
-            
+
             code_lines.append('')
             code_lines.append('')
-        
+
         code_lines.append('# ============== 关系类型定义 ==============')
         code_lines.append('')
-        
+
         # 生成关系类型
         for edge in ontology.get("edge_types", []):
             name = edge["name"]
             # 转换为PascalCase类名
             class_name = ''.join(word.capitalize() for word in name.split('_'))
             desc = edge.get("description", f"A {name} relationship.")
-            
-            code_lines.append(f'class {class_name}(EdgeModel):')
+
+            code_lines.append(f'class {class_name}(BaseModel):')
             code_lines.append(f'    """{desc}"""')
-            
+
             attrs = edge.get("attributes", [])
             if attrs:
                 for attr in attrs:
                     attr_name = attr["name"]
                     attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
+                    code_lines.append(f'    {attr_name}: Optional[str] = Field(')
+                    code_lines.append(f'        default=None,')
                     code_lines.append(f'        description="{attr_desc}",')
-                    code_lines.append(f'        default=None')
                     code_lines.append(f'    )')
             else:
                 code_lines.append('    pass')
-            
+
             code_lines.append('')
             code_lines.append('')
-        
+
         # 生成类型字典
         code_lines.append('# ============== 类型配置 ==============')
         code_lines.append('')
@@ -715,18 +809,20 @@ class OntologyGenerator:
             code_lines.append(f'    "{name}": {class_name},')
         code_lines.append('}')
         code_lines.append('')
-        
-        # 生成边的source_targets映射
-        code_lines.append('EDGE_SOURCE_TARGETS = {')
+
+        # 生成 Graphiti 的 edge_type_map： (source, target) -> [edge_name, ...]
+        code_lines.append('EDGE_TYPE_MAP = {')
+        edge_type_map: Dict[tuple, List[str]] = {}
         for edge in ontology.get("edge_types", []):
             name = edge["name"]
-            source_targets = edge.get("source_targets", [])
-            if source_targets:
-                st_list = ', '.join([
-                    f'{{"source": "{st.get("source", "Entity")}", "target": "{st.get("target", "Entity")}"}}'
-                    for st in source_targets
-                ])
-                code_lines.append(f'    "{name}": [{st_list}],')
+            for st in edge.get("source_targets", []):
+                key = (st.get("source", "Entity"), st.get("target", "Entity"))
+                edge_type_map.setdefault(key, [])
+                if name not in edge_type_map[key]:
+                    edge_type_map[key].append(name)
+        for (source, target), names in edge_type_map.items():
+            names_list = ', '.join(f'"{n}"' for n in names)
+            code_lines.append(f'    ("{source}", "{target}"): [{names_list}],')
         code_lines.append('}')
-        
+
         return '\n'.join(code_lines)
